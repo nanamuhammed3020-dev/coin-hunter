@@ -288,16 +288,10 @@ async function getTechnicalIndicators(symbol: string, marketType: string): Promi
 
 async function getTopCryptoSymbols(): Promise<string[]> {
   try {
-    const res = await axios.get('https://api.binance.com/api/v3/ticker/24hr', { timeout: 5000 });
-    if (Array.isArray(res.data)) {
-      return res.data
-        .filter((t: any) => t.symbol.endsWith('USDT'))
-        .sort((a: any, b: any) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
-        .slice(0, 30)
-        .map((t: any) => {
-          const base = t.symbol.replace('USDT', '');
-          return `${base}/USDT`;
-        });
+    // Using CryptoCompare Top Total Vol Full API as a fallback for restricted regions
+    const res = await axios.get('https://min-api.cryptocompare.com/data/top/totalvolfull?limit=30&tsym=USDT', { timeout: 5000 });
+    if (res.data && Array.isArray(res.data.Data)) {
+      return res.data.Data.map((coin: any) => `${coin.CoinInfo.Name}/USDT`);
     }
   } catch (e) {
     log(`Failed to fetch top crypto symbols: ${e}`, "scanner");
