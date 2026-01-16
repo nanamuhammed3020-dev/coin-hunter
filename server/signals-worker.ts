@@ -286,6 +286,31 @@ async function getTechnicalIndicators(symbol: string, marketType: string): Promi
   };
 }
 
+async function getTopCryptoSymbols(): Promise<string[]> {
+  try {
+    const res = await axios.get('https://api.binance.com/api/v3/ticker/24hr', { timeout: 5000 });
+    if (Array.isArray(res.data)) {
+      return res.data
+        .filter((t: any) => t.symbol.endsWith('USDT'))
+        .sort((a: any, b: any) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+        .slice(0, 30)
+        .map((t: any) => {
+          const base = t.symbol.replace('USDT', '');
+          return `${base}/USDT`;
+        });
+    }
+  } catch (e) {
+    log(`Failed to fetch top crypto symbols: ${e}`, "scanner");
+  }
+  return MONITORED_CRYPTO;
+}
+
+const ALL_FOREX_PAIRS = [
+  "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD",
+  "USD/CAD", "NZD/USD", "EUR/GBP", "EUR/JPY", "GBP/JPY",
+  "AUD/JPY", "GBP/CAD", "EUR/AUD", "CAD/JPY", "AUD/CAD"
+];
+
 export async function runScanner(marketType: "crypto" | "forex", isForce: boolean = false, forceChatId?: string, forceTopicId?: string, forcePair?: string, mode?: "setup" | "analyze", imageUrl?: string): Promise<boolean> {
   try {
     const signals = await storage.getSignals();
@@ -310,7 +335,14 @@ export async function runScanner(marketType: "crypto" | "forex", isForce: boolea
       }
     }
 
-    const symbols = forcePair ? [forcePair] : (marketType === "crypto" ? MONITORED_CRYPTO : MONITORED_FOREX);
+    let symbols = forcePair ? [forcePair] : [];
+    if (!forcePair) {
+      if (marketType === "crypto") {
+        symbols = await getTopCryptoSymbols();
+      } else {
+        symbols = ALL_FOREX_PAIRS;
+      }
+    }
     const shuffled = imageUrl ? ["CHART_IMAGE"] : [...symbols].filter(s => !s.includes("BCH")).sort(() => 0.5 - Math.random());
     const symbolsToScan = isForce ? shuffled : shuffled.slice(0, 10);
 
