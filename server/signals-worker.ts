@@ -565,7 +565,7 @@ export async function runMonitoringLoop() {
             const model = "google/gemini-2.0-flash-001";
             const res = await openRouterClient.chat.completions.create({
               model: model,
-              messages: [{ role: "system", content: `Provide brief 2-sentence institutional update for ${signal.symbol} at status ${instStatus}. Analyze the current price ${currentPrice} vs Entry ${entry}. If there is a "SIGNIFICANT ORDER FLOW SHIFT", suggest specific actions like "Move SL to Breakeven", "Close 50%", or "Hold" based on institutional market structure. Focus on "Big Moves" as opportunities for structural adjustments rather than closing. Professional enterprise style with emojis. NO retail terms like scalp/swing.` }]
+              messages: [{ role: "system", content: `Provide brief 2-sentence institutional update for ${signal.symbol} at status ${instStatus}. Analyze the current price ${currentPrice} vs Entry ${entry}. If there is a "SIGNIFICANT ORDER FLOW SHIFT", suggest specific actions like "Move SL to Breakeven", "Close 50%", or "Hold" based on institutional market structure. Focus on "Big Moves" as opportunities for structural adjustments rather than closing. Professional enterprise style with emojis. STRICTLY FORBIDDEN: NEVER use retail terms like "Scalp", "Scalping", "Swing", "Swing Trade", or "Day Trade".` }]
             });
             const updateMsg = `🚨 <b>INSTITUTIONAL UPDATE: ${signal.symbol}</b>\n\n<b>Status:</b> ${instStatus}\n\n${res.choices[0].message?.content}`;
             
