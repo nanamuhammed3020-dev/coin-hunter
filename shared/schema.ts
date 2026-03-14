@@ -114,6 +114,16 @@ export const trades = sqliteTable("trades", {
   createdAt: integer("created_at", { mode: 'timestamp' }).default(sql`CURRENT_TIMESTAMP`).notNull(),
 });
 
+// === COMMAND USAGE TRACKING ===
+export const commandUsage = sqliteTable("command_usage", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: text("user_id").notNull(),
+  command: text("command").notNull(),
+  date: text("date").notNull(), // YYYY-MM-DD format
+  count: integer("count").default(1).notNull(),
+  createdAt: integer("created_at", { mode: 'timestamp' }).default(sql`CURRENT_TIMESTAMP`).notNull(),
+});
+
 export const insertUserSchema = createInsertSchema(users);
 export const insertWalletSchema = createInsertSchema(wallets).omit({ id: true, createdAt: true });
 export const insertSignalSchema = createInsertSchema(signals).omit({ id: true, createdAt: true });
@@ -121,6 +131,7 @@ export const insertTradeSchema = createInsertSchema(trades).omit({ id: true, cre
 export const insertUserLaneSchema = createInsertSchema(userLanes).omit({ id: true });
 export const insertGroupBindingSchema = createInsertSchema(groupBindings).omit({ id: true, createdAt: true });
 export const insertUserSubscriptionSchema = createInsertSchema(userSubscriptions).omit({ id: true, createdAt: true });
+export const insertCommandUsageSchema = createInsertSchema(commandUsage).omit({ id: true, createdAt: true });
 
 export type User = typeof users.$inferSelect;
 export type Wallet = typeof wallets.$inferSelect;
@@ -129,6 +140,7 @@ export type Trade = typeof trades.$inferSelect;
 export type UserLane = typeof userLanes.$inferSelect;
 export type GroupBinding = typeof groupBindings.$inferSelect;
 export type UserSubscription = typeof userSubscriptions.$inferSelect;
+export type CommandUsage = typeof commandUsage.$inferSelect;
 
 export type InsertUser = z.infer<typeof insertUserSchema>;
 export type InsertWallet = z.infer<typeof insertWalletSchema>;
@@ -137,3 +149,4 @@ export type InsertTrade = z.infer<typeof insertTradeSchema>;
 export type InsertUserLane = z.infer<typeof insertUserLaneSchema>;
 export type InsertGroupBinding = z.infer<typeof insertGroupBindingSchema>;
 export type InsertUserSubscription = z.infer<typeof insertUserSubscriptionSchema>;
+export type InsertCommandUsage = z.infer<typeof insertCommandUsageSchema>;

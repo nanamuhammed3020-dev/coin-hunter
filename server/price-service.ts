@@ -17,6 +17,61 @@ export async function fetchPriceData(symbol: string): Promise<PriceData | null> 
   const quote = parts[1]?.toUpperCase() || 'USDT';
   const pair = `${base.toUpperCase()}/${quote}`;
 
+  // Comprehensive validation to prevent API calls for invalid symbols
+  const validCryptoBases = [
+    // Major coins
+    'btc', 'eth', 'sol', 'bnb', 'xrp', 'ada', 'doge', 'avax', 'dot', 'trx',
+    'link', 'matic', 'shib', 'ltc', 'bch', 'uni', 'near', 'atom', 'xmr', 'etc',
+    'algo', 'vet', 'icp', 'fil', 'hbar', 'flow', 'mana', 'sand', 'axs', 'chz',
+    'enj', 'bat', 'storj', 'grt', 'lpt', 'rep', 'nmr', 'aave', 'sushi', 'comp',
+    'mkr', 'yfi', 'bal', 'ren', 'lrc', 'omg', 'zrx', 'ant', 'cro', 'cake', 'sxp',
+    'alpha', 'inj', 'klv', 'pundix', 'celr', 'chr', 'tkx', 'win', 'hot', 'dent',
+    'nano', 'waves', 'zil', 'sc', 'steem', 'strat', 'xem', 'ardr', 'gxs', 'ubq',
+    'pivx', 'xvg', 'blk', 'gam', 'nxs', 'ioc', 'sys', 'nav', 'xst', 'nxt', 'burst',
+    // Additional popular coins
+    'zec', 'pepe', 'xlm', 'bonk', 'usdc', 'usdt', 'busd', 'dai', 'tusd', 'usdp',
+    'frax', 'lusd', 'susd', 'eurs', 'xaut', 'paxg', 'wbtc', 'renbtc', 'sbtc',
+    'theta', 'icx', 'iost', 'qtum', 'btg', 'zec', 'dash', 'xem', 'btcp', 'bcd',
+    'dgb', 'xzc', 'btcd', 'blk', 'rdd', 'tx', 'ftc', 'nxt', 'burst', 'sls', 'xcp',
+    'rads', 'dcr', 'xmr', 'vtc', 'nvc', 'ppc', 'mec', 'aur', 'ixc', 'nxt', 'zet',
+    'clam', 'sxc', 'qtl', 'enrg', 'ric', 'efc', 'dgc', 'frc', 'nvc', 'btb', 'bqc',
+    'yac', 'dmd', 'arg', 'adc', 'xpm', 'gld', 'j', 'rpc', 'spt', 'nka', 'wdc', 'bkc',
+    'xmy', 'moo', 'bte', 'xvg', 'cgb', 'sup', 'nrb', 'vrc', 'phs', 'src', 'exc',
+    'mue', 'fsc', 'cnc', 'btw', 'bcy', 'frk', 'pzt', 'cap', 'xjo', 'hil', 'kdc',
+    'pand', 'aur', 'bqc', 'yac', 'dmd', 'arg', 'adc', 'xpm', 'gld', 'j', 'rpc',
+    'spt', 'nka', 'wdc', 'bkc', 'xmy', 'moo', 'bte', 'xvg', 'cgb', 'sup', 'nrb',
+    'vrc', 'phs', 'src', 'exc', 'mue', 'fsc', 'cnc', 'btw', 'bcy', 'frk', 'pzt',
+    'cap', 'xjo', 'hil', 'kdc', 'pand', 'mzc', 'hil', 'kdc', 'pand', 'mzc', 'anc',
+    'trc', 'glc', 'sxc', 'ric', 'efc', 'dgc', 'frc', 'nvc', 'btb', 'bqc', 'yac',
+    'dmd', 'arg', 'adc', 'xpm', 'gld', 'j', 'rpc', 'spt', 'nka', 'wdc', 'bkc',
+    'xmy', 'moo', 'bte', 'xvg', 'cgb', 'sup', 'nrb', 'vrc', 'phs', 'src', 'exc',
+    'mue', 'fsc', 'cnc', 'btw', 'bcy', 'frk', 'pzt', 'cap', 'xjo', 'hil', 'kdc',
+    'pand', 'mzc', 'anc', 'trc', 'glc', 'sxc', 'ric', 'efc', 'dgc', 'frc', 'nvc',
+    'btb', 'bqc', 'yac', 'dmd', 'arg', 'adc', 'xpm', 'gld', 'j', 'rpc', 'spt',
+    'nka', 'wdc', 'bkc', 'xmy', 'moo', 'bte', 'xvg', 'cgb', 'sup', 'nrb', 'vrc',
+    'phs', 'src', 'exc', 'mue', 'fsc', 'cnc', 'btw', 'bcy', 'frk', 'pzt', 'cap',
+    'xjo', 'hil', 'kdc', 'pand', 'mzc', 'anc', 'trc', 'glc'
+  ];
+
+  const validForexBases = ['eur', 'gbp', 'jpy', 'aud', 'cad', 'chf', 'nzd', 'usd'];
+  const validQuotes = ['usdt', 'usd', 'btc', 'eth', 'eur', 'gbp', 'jpy', 'aud', 'cad', 'chf', 'nzd'];
+
+  const isValidCrypto = validCryptoBases.includes(base) && validQuotes.includes(quote.toLowerCase());
+  // Special case: allow BTC/USD as crypto pair for weekend forex trading
+  const isBtcUsd = base === 'btc' && quote.toLowerCase() === 'usd';
+  const isValidForex = validForexBases.includes(base) && validForexBases.includes(quote.toLowerCase()) && base !== quote;
+
+  if (!isValidCrypto && !isValidForex && !isBtcUsd) {
+    log(`Invalid or unsupported symbol: ${symbol}`, "price-service");
+    return null;
+  }
+
+  // Prevent same base/quote pairs
+  if (base === quote.toLowerCase()) {
+    log(`Invalid pair: ${symbol} (same base and quote)`, "price-service");
+    return null;
+  }
+
   // 1. Binance (High rate limit)
   try {
     const binanceSymbol = `${base}${quote}`.toUpperCase();
@@ -33,7 +88,9 @@ export async function fetchPriceData(symbol: string): Promise<PriceData | null> 
         source: 'Binance'
       };
     }
-  } catch (e) { /* silent fail for fallback */ }
+  } catch (e) { 
+    log(`Binance failed for ${symbol}: ${e.message}`, "price-service");
+  }
 
   // 2. CryptoCompare (Alternative reliable source)
   try {
@@ -79,17 +136,25 @@ export async function fetchPriceData(symbol: string): Promise<PriceData | null> 
     }
   } catch (e) { /* silent fail */ }
 
-  // 4. CoinGecko (Fallback)
+  // 4. CoinGecko (Fallback) - with rate limiting
   try {
+    // Add delay to prevent rate limiting
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
     const cgRes = await axios.get(`https://api.coingecko.com/api/v3/simple/price?ids=${base}&vs_currencies=usd&include_24hr_vol=true&include_24hr_change=true`, { timeout: 5000 });
     let data = cgRes.data[base];
     
     if (!data) {
-      const searchRes = await axios.get(`https://api.coingecko.com/api/v3/search?query=${base}`, { timeout: 5000 });
-      const coinId = searchRes.data?.coins?.[0]?.id;
-      if (coinId) {
-        const priceRes = await axios.get(`https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd&include_24hr_vol=true&include_24hr_change=true`, { timeout: 5000 });
-        data = priceRes.data[coinId];
+      // Only try search if base looks like a coin name
+      if (base.length > 2) {
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Additional delay
+        const searchRes = await axios.get(`https://api.coingecko.com/api/v3/search?query=${base}`, { timeout: 5000 });
+        const coinId = searchRes.data?.coins?.[0]?.id;
+        if (coinId) {
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Additional delay
+          const priceRes = await axios.get(`https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd&include_24hr_vol=true&include_24hr_change=true`, { timeout: 5000 });
+          data = priceRes.data[coinId];
+        }
       }
     }
 

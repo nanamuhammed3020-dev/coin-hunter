@@ -4,53 +4,91 @@ import { storage } from "./storage";
 import { log } from "./index";
 import { db } from "./db";
 import { eq, and, or, sql, desc, count } from "drizzle-orm";
-import { Keypair } from "@solana/web3.js";
-import bs58 from "bs58";
 import axios from "axios";
-import { JupiterService } from "./solana";
 import OpenAI from "openai";
 import { getTelegramBot } from "./telegram";
 
 const rpcUrl = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
-const jupiter = new JupiterService(rpcUrl);
 
 export let openRouterClient: OpenAI | null = null;
 
 async function initAI() {
-  const apiKey = process.env.OPENROUTER_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
-  let baseURL: string | undefined;
+  const openRouterKey = process.env.OPENROUTER_API_KEY;
+  const openAiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
   
-  log(`Initializing AI with keys present: OPENROUTER:${!!process.env.OPENROUTER_API_KEY}, AI_INT_OPENAI:${!!process.env.AI_INTEGRATIONS_OPENAI_API_KEY}, OPENAI:${!!process.env.OPENAI_API_KEY}`, "express");
+  log(`Initializing AI with keys present: OPENROUTER:${!!openRouterKey}, OPENAI:${!!openAiKey}`, "express");
 
-  if (process.env.OPENROUTER_API_KEY) {
-    baseURL = process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
-  } else {
-    baseURL = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || undefined;
-  }
+  // Try OpenRouter first if key is available
+  if (openRouterKey) {
+    try {
+      openRouterClient = new OpenAI({
+        apiKey: openRouterKey,
+        baseURL: process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1",
+        dangerouslyAllowBrowser: true,
+        defaultHeaders: {
+          "X-Title": "Coin Hunter AI Bot",
+        }
+      });
+      
+      // Test the connection with a simple request
+      const testResponse = await openRouterClient.chat.completions.create({
+        model: "anthropic/claude-3-haiku",
+        messages: [{ role: "user", content: "Hello" }],
+        max_tokens: 10
+      });
 
-  if (apiKey) {
-    openRouterClient = new OpenAI({
-      apiKey,
-      baseURL,
-      dangerouslyAllowBrowser: true,
-      defaultHeaders: {
-        "X-Title": "SMC Trading Bot",
+      if (testResponse.choices && testResponse.choices[0]) {
+        log("AI service initialized successfully with OpenRouter API");
+        return;
+      } else {
+        throw new Error("Invalid API response");
       }
-    });
-    log(`SMC Worker AI initialized with ${baseURL ? 'OpenRouter' : 'OpenAI'} API`);
-  } else {
-    log("SMC Worker AI environment variables missing - no API key found", "express");
+    } catch (error: any) {
+      log(`OpenRouter initialization failed: ${error.message}`, "express");
+      if (error.status === 401) {
+        log("OpenRouter API key appears to be invalid (401 User not found)", "express");
+      }
+      openRouterClient = null;
+    }
   }
+
+  // Fallback to OpenAI if available
+  if (openAiKey) {
+    try {
+      openRouterClient = new OpenAI({
+        apiKey: openAiKey,
+        dangerouslyAllowBrowser: true,
+        defaultHeaders: {
+          "X-Title": "Coin Hunter AI Bot",
+        }
+      });
+      
+      // Test the connection
+      await openRouterClient.models.list();
+      log("AI service initialized successfully with OpenAI API");
+      return;
+    } catch (error: any) {
+      log(`OpenAI initialization failed: ${error.message}`, "express");
+    }
+  }
+
+  log("No working AI API key found. AI features will be disabled.", "express");
+  openRouterClient = null;
 }
 
 initAI().catch(err => log(`Failed to initialize AI: ${err}`));
 
+// Top 40 volume cryptocurrencies (excluding stable coins)
+// Based on 24h trading volume on major exchanges
 const MONITORED_CRYPTO = [
   "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
   "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "DOT/USDT", "TRX/USDT",
-  "LINK/USDT", "MATIC/USDT", "SHIB/USDT", "LTC/USDT", "BCH/USDT",
-  "UNI/USDT", "NEAR/USDT", "ATOM/USDT", "XMR/USDT", "ETC/USDT",
-  "ALGO/USDT", "VET/USDT", "ICP/USDT", "FIL/USDT", "HBAR/USDT"
+  "LINK/USDT", "MATIC/USDT", "LTC/USDT", "BCH/USDT", "UNI/USDT",
+  "NEAR/USDT", "ATOM/USDT", "ETC/USDT", "ALGO/USDT", "ICP/USDT",
+  "FIL/USDT", "HBAR/USDT", "VET/USDT", "THETA/USDT", "FLOW/USDT",
+  "MANA/USDT", "SAND/USDT", "AXS/USDT", "CHZ/USDT", "ENJ/USDT",
+  "BAT/USDT", "STORJ/USDT", "GRT/USDT", "LPT/USDT", "REP/USDT",
+  "NMR/USDT", "AAVE/USDT", "SUSHI/USDT", "COMP/USDT", "MKR/USDT"
 ];
 
 const MONITORED_FOREX = [
@@ -67,7 +105,7 @@ ROLE: Elite Institutional SMC Strategist 🏛️💎📈
 - SMC CORE: Analyze BOS, CHoCH, Liquidity Sweeps, and HTF Order Blocks/FVG.
 - CANDLESTICK ANALYSIS: Focus on HTF (4H/Daily) context. Analyze candle body size (momentum), long wicks (rejection/support), and multi-candle pattern confirmation (Engulfing, Morning Star, etc.).
 - INDICATORS: Incorporate EMA (9/21), RSI (30/70), MACD, Bollinger Bands, VWAP, Ichimoku Cloud, and ${type === 'crypto' ? 'On-Chain Metrics (NVT, Active Addresses)' : 'Forex Market Sentiment'}.
-- RISK: Minimum 1:3 Risk/Reward. Absolute structural invalidation for SL.
+- RISK: Minimum 1:2 Risk/Reward. Absolute structural invalidation for SL.
 - TECHNICAL SCORE: Calculate based on confluence. 100 is ONLY for perfect alignment of all 7+ factors.
 
 📊 INSTITUTIONAL OUTPUT STRUCTURE:
@@ -193,13 +231,37 @@ async function runUnifiedScanner() {
     const activeCryptoBindings = filterByCooldown(cryptoBindings, "crypto");
     const activeForexBindings = filterByCooldown(forexBindings, "forex");
 
+    // Check total active signals (max 3 across both markets)
+    const allSignals = await storage.getSignals();
+    const activeSignals = allSignals.filter(s => s.status === "active");
+    const maxActiveSignals = 3;
+
+    if (activeSignals.length >= maxActiveSignals) {
+      log(`[scanner] Maximum active signals reached (${activeSignals.length}/${maxActiveSignals}). Skipping scan.`, "scanner");
+      return;
+    }
+
+    // Check daily signal limits (1 per day per market type)
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todaySignals = allSignals.filter(s => {
+      const signalDate = new Date(s.createdAt);
+      signalDate.setHours(0, 0, 0, 0);
+      return signalDate.getTime() === today.getTime();
+    });
+
+    const todayCryptoSignals = todaySignals.filter(s => s.type === "crypto").length;
+    const todayForexSignals = todaySignals.filter(s => s.type === "forex").length;
+
     if (activeCryptoBindings.length === 0 && cryptoBindings.length > 0) {
       log("[scanner] All crypto groups are on cooldown. Skipping crypto scan.", "scanner");
     } else if (cryptoBindings.length === 0) {
       log("⚠️ ATTENTION: No crypto signal group bindings found. Use /bind crypto in your Telegram crypto group.", "scanner");
+    } else if (todayCryptoSignals >= 1) {
+      log(`[scanner] Daily crypto signal limit reached (${todayCryptoSignals}/1). Skipping crypto scan.`, "scanner");
     } else {
       log(`Found ${activeCryptoBindings.length} active crypto bindings (out of ${cryptoBindings.length}).`, "scanner");
-      const cryptoActive = (await storage.getSignals()).find(s => s.status === "active" && s.type === "crypto");
+      const cryptoActive = activeSignals.find(s => s.type === "crypto");
       if (cryptoActive && !isForce) {
         log(`Active crypto signal already exists: ${cryptoActive.symbol}. Skipping scan.`, "scanner");
       } else {
@@ -211,12 +273,28 @@ async function runUnifiedScanner() {
       log("[scanner] All forex groups are on cooldown. Skipping forex scan.", "scanner");
     } else if (forexBindings.length === 0) {
       log("⚠️ ATTENTION: No forex signal group bindings found. Use /bind forex in your Telegram forex group.", "scanner");
+    } else if (todayForexSignals >= 1) {
+      log(`[scanner] Daily forex signal limit reached (${todayForexSignals}/1). Skipping forex scan.`, "scanner");
     } else {
       log(`Found ${activeForexBindings.length} active forex bindings (out of ${forexBindings.length}).`, "scanner");
+      // On weekends, force BTCUSD signal instead of skipping
       if (isWeekend && !isForce) {
-        log("Forex market closed (Weekend).", "scanner");
+        log("Forex market weekend - sending BTC/USD signal via crypto scanner instead.", "scanner");
+        // Check if we can send a crypto signal instead
+        if (todayCryptoSignals < 1 && activeCryptoBindings.length > 0) {
+          const cryptoActive = activeSignals.find(s => s.type === "crypto");
+          if (!cryptoActive) {
+            log("Weekend forex replacement: Sending BTC/USDT signal to maintain consistency.", "scanner");
+            await runScanner("crypto", false, undefined, undefined, "BTC/USDT");
+          } else {
+            log(`Active crypto signal exists (${cryptoActive.symbol}). Cannot send BTC/USD weekend signal.`, "scanner");
+          }
+        } else {
+          log(`Cannot send weekend BTC/USD signal - crypto daily limit reached (${todayCryptoSignals}/1) or no crypto bindings (${activeCryptoBindings.length}).`, "scanner");
+        }
       } else {
-        const forexActive = (await storage.getSignals()).find(s => s.status === "active" && s.type === "forex");
+        log("Weekday detected - proceeding with regular forex signal scan.", "scanner");
+        const forexActive = activeSignals.find(s => s.type === "forex");
         if (forexActive && !isForce) {
           log(`Active forex signal already exists: ${forexActive.symbol}. Skipping scan.`, "scanner");
         } else {
@@ -289,13 +367,28 @@ async function getTechnicalIndicators(symbol: string, marketType: string): Promi
 async function getTopCryptoSymbols(): Promise<string[]> {
   try {
     // Using CryptoCompare Top Total Vol Full API as a fallback for restricted regions
-    const res = await axios.get('https://min-api.cryptocompare.com/data/top/totalvolfull?limit=30&tsym=USDT', { timeout: 5000 });
+    const res = await axios.get('https://min-api.cryptocompare.com/data/top/totalvolfull?limit=50&tsym=USDT', { timeout: 5000 });
     if (res.data && Array.isArray(res.data.Data)) {
-      return res.data.Data.map((coin: any) => `${coin.CoinInfo.Name}/USDT`);
+      // Filter out stable coins and limit to top 40
+      const filteredCoins = res.data.Data
+        .filter((coin: any) => {
+          const name = coin.CoinInfo.Name.toUpperCase();
+          // Exclude stable coins
+          const stableCoins = ['USDT', 'USDC', 'BUSD', 'DAI', 'TUSD', 'USDP', 'FRAX', 'LUSD', 'EURS', 'XAUT', 'PAXG'];
+          return !stableCoins.includes(name);
+        })
+        .slice(0, 40) // Top 40 volume coins
+        .map((coin: any) => `${coin.CoinInfo.Name}/USDT`);
+
+      if (filteredCoins.length >= 10) {
+        return filteredCoins;
+      }
     }
   } catch (e) {
     log(`Failed to fetch top crypto symbols: ${e}`, "scanner");
   }
+
+  // Fallback to our curated list (already filtered for top volume, no stables)
   return MONITORED_CRYPTO;
 }
 
@@ -341,19 +434,43 @@ export async function runScanner(marketType: "crypto" | "forex", isForce: boolea
     const symbolsToScan = isForce ? shuffled : shuffled.slice(0, 10);
 
     for (const symbol of symbolsToScan) {
+      // Skip AI calls if client is not available or not working
+      if (!openRouterClient) {
+        log(`[scanner] AI client not available, skipping ${symbol}`, "scanner");
+        continue;
+      }
+
       let currentPrice = 0;
       let sentiment = "N/A";
-      
+      let volume24h = 0;
+
       if (symbol !== "CHART_IMAGE") {
         currentPrice = await getPrice(symbol, marketType);
-        if (currentPrice === 0) continue; 
+        if (currentPrice === 0) continue;
+        
+        // Check volume for the pair (optional - don't skip if no data)
+        try {
+          const priceData = await fetchPriceData(symbol);
+          if (priceData && priceData.volume24h) {
+            volume24h = parseFloat(priceData.volume24h || "0");
+            
+            // Only skip pairs with explicitly low volume (not just missing data)
+            const minVolumeThreshold = marketType === 'crypto' ? 10000 : 1000; // Lower thresholds: $10k for crypto, $1k for forex
+            if (volume24h > 0 && volume24h < minVolumeThreshold) {
+              log(`[scanner] Skipping ${symbol} - insufficient volume: $${volume24h.toLocaleString()} (min: $${minVolumeThreshold.toLocaleString()})`, "scanner");
+              continue;
+            }
+          }
+          // If no volume data available, still allow the pair (don't skip)
+        } catch (e) {
+          log(`[scanner] Volume check failed for ${symbol}: ${e.message}`, "scanner");
+          // Don't skip on volume check failure - still allow the pair
+        }
+        
         if (marketType === "crypto") sentiment = await getSentiment(symbol);
       }
-      
+
       const indicators = await getTechnicalIndicators(symbol, marketType);
-      
-      if (!openRouterClient) await initAI();
-      if (!openRouterClient) continue;
 
       const sysPrompt = mode === "setup" ? SETUP_PROMPT : (mode === "analyze" ? ANALYZE_PROMPT : INSTITUTIONAL_PROMPT(marketType));
       const indicatorsStr = JSON.stringify(indicators, null, 2);
@@ -368,7 +485,7 @@ CRITICAL: You MUST use the provided indicators (EMA 9/21, RSI, MACD, VWAP, Ichim
 
       try {
         const response = await openRouterClient.chat.completions.create({
-          model: "google/gemini-2.0-flash-001",
+          model: "anthropic/claude-3-haiku",
           messages: imageUrl ? [
             { role: "system", content: sysPrompt + "\n\nCRITICAL: You are analyzing a chart image. Identify exact price levels, structures, and POIs visible on the chart with ultra-precision." },
             { role: "user", content: [
@@ -439,7 +556,81 @@ async function postSignalToGroup(bot: any, chatId: string, topicId: string | und
       msgOptions.message_thread_id = parseInt(topicId);
     }
 
-    const sent = await bot.sendMessage(chatId, analysis, msgOptions);
+    // Check if this is a premium group for enhanced signals
+    const premiumGroupIds = process.env.PREMIUM_GROUP_IDS?.split(',') || [];
+    const isPremiumGroup = premiumGroupIds.includes(chatId);
+
+    let enhancedAnalysis = analysis;
+    let confidenceScore = "Medium";
+    let riskReward = "1:2";
+
+    if (isPremiumGroup) {
+      // Generate premium enhancements
+      try {
+        const confidenceMatch = analysis.match(/confidence[:\s]*(\w+)/i) || analysis.match(/probability[:\s]*(\d+)%/i);
+        if (confidenceMatch) {
+          const confValue = confidenceMatch[1].toLowerCase();
+          if (confValue.includes('high') || (confValue.match(/\d+/) && parseInt(confValue) > 75)) {
+            confidenceScore = "High";
+          } else if (confValue.includes('low') || (confValue.match(/\d+/) && parseInt(confValue) < 50)) {
+            confidenceScore = "Low";
+          }
+        }
+
+        // Calculate risk-reward ratio
+        const entryMatch = analysis.match(/Entry:?\s*([\d.]+)/i);
+        const tpMatch = analysis.match(/Take Profit:?\s*([\d.]+)/i) || analysis.match(/Target:?\s*([\d.]+)/i);
+        const slMatch = analysis.match(/Stop Loss:?\s*([\d.]+)/i);
+
+        if (entryMatch && tpMatch && slMatch) {
+          const entry = parseFloat(entryMatch[1]);
+          const tp = parseFloat(tpMatch[1]);
+          const sl = parseFloat(slMatch[1]);
+
+          const risk = Math.abs(entry - sl);
+          const reward = Math.abs(tp - entry);
+          const rr = reward / risk;
+
+          riskReward = `1:${rr.toFixed(1)}`;
+        }
+
+        // Add premium header with confidence and risk-reward
+        enhancedAnalysis = `🚀 <b>PREMIUM SIGNAL - ${symbol}</b>\n` +
+                          `📊 <b>Confidence:</b> ${confidenceScore} | 🎯 <b>Risk:Reward:</b> ${riskReward}\n\n` +
+                          analysis;
+
+        // Add premium footer with additional insights
+        enhancedAnalysis += `\n\n💎 <b>Premium Analysis:</b>\n` +
+                           `• <b>Position Sizing:</b> Risk max 1-2% of portfolio\n` +
+                           `• <b>Timeframe:</b> 2-4 hour holding period\n` +
+                           `• <b>Confirmation:</b> Wait for volume spike at entry\n` +
+                           `• <b>Management:</b> Scale out 50% at TP1, let remaining run`;
+
+      } catch (e) {
+        log(`Premium enhancement failed for ${symbol}: ${e.message}`, "scanner");
+        // Fall back to regular analysis if enhancement fails
+      }
+    }
+
+    // Send the enhanced analysis (premium) or regular analysis
+    const sent = await bot.sendMessage(chatId, enhancedAnalysis, msgOptions);
+
+    // Extract and post TP/SL levels separately for clarity
+    const entryMatch = analysis.match(/Institutional Entry:\s*([\d.]+)/i) || analysis.match(/Entry:\s*([\d.]+)/i);
+    const tpMatch = analysis.match(/Take Profit:\s*([\d.]+)/i) || analysis.match(/Target.*?:\s*([\d.]+)/i);
+    const slMatch = analysis.match(/Stop Loss:\s*([\d.]+)/i) || analysis.match(/Invalidation.*?:\s*([\d.]+)/i);
+
+    if (entryMatch || tpMatch || slMatch) {
+      let levelsMessage = `🎯 <b>${symbol} - Key Levels</b>\n\n`;
+      if (entryMatch) levelsMessage += `📍 <b>Entry:</b> ${entryMatch[1]}\n`;
+      if (tpMatch) levelsMessage += `🎯 <b>Take Profit:</b> ${tpMatch[1]}\n`;
+      if (slMatch) levelsMessage += `🛑 <b>Stop Loss:</b> ${slMatch[1]}\n`;
+
+      await bot.sendMessage(chatId, levelsMessage, { 
+        parse_mode: 'HTML', 
+        message_thread_id: topicId && !isNaN(parseInt(topicId)) ? parseInt(topicId) : undefined 
+      });
+    }
 
     if (!isForce) {
       try { await bot.pinChatMessage(chatId, sent.message_id); } catch (e) {
@@ -475,6 +666,66 @@ export async function runMonitoringLoop() {
       if (currentPrice === 0) {
         log(`[monitor] Failed to get price for ${signal.symbol}`, "monitor");
         continue;
+      }
+
+      // Check if signal is older than 3 days and auto-close it
+      const signalAge = Date.now() - new Date(signal.createdAt).getTime();
+      const threeDaysMs = 3 * 24 * 60 * 60 * 1000;
+      
+      if (signalAge > threeDaysMs) {
+        log(`[monitor] Signal ${signal.symbol} is older than 3 days (${Math.round(signalAge / (24 * 60 * 60 * 1000))} days). Auto-closing.`, "monitor");
+        
+        const entry = parseFloat(signal.entryPrice || "0");
+        const priceChange = entry > 0 ? ((currentPrice - entry) / entry) * 100 : 0;
+        const priceChangeText = priceChange > 0 ? `+${priceChange.toFixed(2)}%` : `${priceChange.toFixed(2)}%`;
+        
+        const closeReason = `AUTO-CLOSE: Signal exceeded 3-day holding period\nEntry: ${entry.toFixed(signal.type === 'forex' ? 5 : 2)}\nCurrent: ${currentPrice.toFixed(signal.type === 'forex' ? 5 : 2)}\nP&L: ${priceChangeText}\nReason: Maximum holding time reached - reassess market conditions`;
+        
+        // Send close notification to all bound groups
+        const targetBindings = await db.select().from(groupBindings).where(
+          or(
+            eq(groupBindings.market, signal.type),
+            eq(groupBindings.lane, signal.type)
+          )
+        );
+        
+        for (const binding of targetBindings) {
+          try {
+            const closeMessage = `🚨 <b>SIGNAL CLOSED: ${signal.symbol}</b>\n\n${closeReason}`;
+            const closeOptions: any = { parse_mode: 'HTML' };
+            if (binding.topicId && !isNaN(parseInt(binding.topicId))) {
+              closeOptions.message_thread_id = parseInt(binding.topicId);
+            }
+            await bot.sendMessage(binding.groupId, closeMessage, closeOptions);
+            log(`[monitor] Sent auto-close notification for ${signal.symbol} to ${binding.groupId}`, "monitor");
+          } catch (e: any) {
+            log(`[monitor] Failed to send auto-close to ${binding.groupId}: ${e.message}`, "monitor");
+          }
+        }
+        
+        // Mark signal as completed
+        await storage.updateSignal(signal.id, { 
+          status: "completed", 
+          lastUpdateAt: new Date() 
+        });
+        
+        // Set cooldown for the market type
+        log(`[monitor] Auto-closed signal for ${signal.symbol}. Triggering 10m cooldown for ${signal.type} bindings.`, "monitor");
+        const cooldownKey = `cooldown_${signal.type}`;
+        const cooldownTime = Date.now() + (10 * 60 * 1000);
+        
+        for (const targetBinding of targetBindings) {
+          try {
+            const currentData = (typeof (targetBinding as any).data === 'string' ? JSON.parse((targetBinding as any).data) : (targetBinding as any).data) || {};
+            await db.update(groupBindings).set({
+              data: JSON.stringify({ ...currentData, [cooldownKey]: cooldownTime })
+            } as any).where(eq(groupBindings.id, targetBinding.id));
+          } catch (e: any) {
+            log(`[monitor] Failed to set cooldown for group ${targetBinding.groupId}: ${e.message}`, "monitor");
+          }
+        }
+        
+        continue; // Skip normal monitoring for this signal
       }
 
       const signalData = (typeof signal.data === 'string' ? JSON.parse(signal.data) : signal.data) || {};
@@ -519,12 +770,11 @@ export async function runMonitoringLoop() {
         statusUpdate = "SIGNIFICANT ORDER FLOW SHIFT ⚠️ (STRUCTURAL UPDATE REQUIRED)";
       }
 
-      // 10 minute heartbeat for regular updates
-      const isHeartbeat = diffMin >= 10; 
-      const shouldPost = true; // FORCE POST FOR TESTING
+      // Only post updates for significant events or major price movements
+      const shouldPost = !!statusUpdate || isBigMove;
 
       if (shouldPost) {
-        log(`[monitor] UPDATE TRIGGERED for ${signal.symbol}. Reason: ${statusUpdate || 'Heartbeat'}, Diff: ${diffMin.toFixed(1)}m`, "monitor");
+        log(`[monitor] UPDATE TRIGGERED for ${signal.symbol}. Reason: ${statusUpdate || 'Big Move'}, Diff: ${diffMin.toFixed(1)}m`, "monitor");
         const targetBindings = await db.select().from(groupBindings).where(
           or(
             eq(groupBindings.market, signal.type),
@@ -537,82 +787,105 @@ export async function runMonitoringLoop() {
           const finalStatusUpdate = statusUpdate || `INSTITUTIONAL UPDATE ⏱\nPrice: ${currentPrice.toFixed(signal.type === 'forex' ? 5 : 2)}`;
           log(`[monitor] Posting to ${binding.groupId} for ${signal.symbol} (Topic: ${binding.topicId})`, "monitor");
           
-          if (!openRouterClient) await initAI();
-          if (!openRouterClient) continue;
-
-          try {
-            const signalData = (typeof signal.data === 'string' ? JSON.parse(signal.data) : signal.data) || {};
-            const lastUpdateIdKey = `lastUpdateMessageId_${binding.groupId}_${binding.topicId || 'main'}`;
-            const lastUpdateId = signalData[lastUpdateIdKey];
-            
-            if (lastUpdateId) {
-              log(`[monitor] Deleting previous update ${lastUpdateId} in group ${binding.groupId}`, "monitor");
-              try {
-                await bot.deleteMessage(binding.groupId, parseInt(lastUpdateId));
-              } catch (e: any) {
-                log(`[monitor] Delete error in group ${binding.groupId}: ${e.message}`, "monitor");
-              }
-            }
-
-            const isTp = finalStatusUpdate.includes("TP HIT") || finalStatusUpdate.includes("TARGET");
-            const isSl = finalStatusUpdate.includes("SL HIT") || finalStatusUpdate.includes("INVALIDATION");
-            const isFinalStatus = isTp || isSl;
-
-            const instStatus = isTp ? "🎯 TARGET LIQUIDITY MITIGATED (TP HIT)" : 
-                              isSl ? "🛑 STRUCTURAL INVALIDATION TRIGGERED (SL HIT)" :
-                              statusUpdate || `INSTITUTIONAL UPDATE ⏱ Price: ${currentPrice.toFixed(signal.type === 'forex' ? 5 : 2)}`;
-
-            const model = "google/gemini-2.0-flash-001";
-            const res = await openRouterClient.chat.completions.create({
-              model: model,
-              messages: [{ role: "system", content: `Provide brief 2-sentence institutional update for ${signal.symbol} at status ${instStatus}. Analyze the current price ${currentPrice} vs Entry ${entry}. If there is a "SIGNIFICANT ORDER FLOW SHIFT", suggest specific actions like "Move SL to Breakeven", "Close 50%", or "Hold" based on institutional market structure. Focus on "Big Moves" as opportunities for structural adjustments rather than closing. Professional enterprise style with emojis. STRICTLY FORBIDDEN: NEVER use retail terms like "Scalp", "Scalping", "Swing", "Swing Trade", or "Day Trade".` }]
-            });
-            const updateMsg = `🚨 <b>INSTITUTIONAL UPDATE: ${signal.symbol}</b>\n\n<b>Status:</b> ${instStatus}\n\n${res.choices[0].message?.content}`;
-            
-            log(`[monitor] Sending message to group ${binding.groupId} thread ${binding.topicId}`, "monitor");
-            const updateOptions: any = { 
-              parse_mode: 'HTML'
-            };
-            
-            if (binding.topicId && !isNaN(parseInt(binding.topicId))) {
-              updateOptions.message_thread_id = parseInt(binding.topicId);
-            }
-
-            const sent = await bot.sendMessage(binding.groupId, updateMsg, updateOptions);
-
-            // Immediately log for verification
-            log(`[monitor] Successfully sent update for ${signal.symbol} to group ${binding.groupId}`, "monitor");
-
-            await storage.updateSignal(signal.id, {
-              status: isFinalStatus ? "completed" : "active",
-              lastUpdateAt: new Date(),
-              data: JSON.stringify({ 
-                ...signalData, 
-                [lastUpdateIdKey]: sent.message_id.toString(), 
-                lastMonitoredPrice: currentPrice 
-              })
-            });
-
-            if (isFinalStatus) {
-              log(`[monitor] Final status for ${signal.symbol}. Triggering 10m cooldown for ${signal.type} bindings.`, "monitor");
-              const cooldownKey = `cooldown_${signal.type}`;
-              const cooldownTime = Date.now() + (10 * 60 * 1000);
+          // Check if this is a final status (TP/SL hit)
+          const isTp = statusUpdate.includes("TAKE PROFIT HIT");
+          const isSl = statusUpdate.includes("STOP LOSS HIT");
+          const isFinalStatus = isTp || isSl;
+          
+          // Only use AI for major updates (TP/SL hits), use simple messages for other updates
+          const isMajorUpdate = isFinalStatus;
+          
+          let updateMsg: string;
+          if (isMajorUpdate && openRouterClient) {
+            try {
+              const signalData = (typeof signal.data === 'string' ? JSON.parse(signal.data) : signal.data) || {};
+              const lastUpdateIdKey = `lastUpdateMessageId_${binding.groupId}_${binding.topicId || 'main'}`;
+              const lastUpdateId = signalData[lastUpdateIdKey];
               
-              for (const targetBinding of targetBindings) {
+              if (lastUpdateId) {
+                log(`[monitor] Deleting previous update ${lastUpdateId} in group ${binding.groupId}`, "monitor");
                 try {
-                  const currentData = (typeof (targetBinding as any).data === 'string' ? JSON.parse((targetBinding as any).data) : (targetBinding as any).data) || {};
-                  await db.update(groupBindings).set({
-                    data: JSON.stringify({ ...currentData, [cooldownKey]: cooldownTime })
-                  } as any).where(eq(groupBindings.id, targetBinding.id));
+                  await bot.deleteMessage(binding.groupId, parseInt(lastUpdateId));
                 } catch (e: any) {
-                  log(`[monitor] Failed to set cooldown for group ${targetBinding.groupId}: ${e.message}`, "monitor");
+                  log(`[monitor] Delete error in group ${binding.groupId}: ${e.message}`, "monitor");
                 }
               }
+
+              const priceChange = entry > 0 ? ((currentPrice - entry) / entry) * 100 : 0;
+              const priceChangeText = priceChange > 0 ? `+${priceChange.toFixed(2)}%` : `${priceChange.toFixed(2)}%`;
+              const direction = signal.bias === 'bullish' ? (priceChange > 0 ? '📈' : '📉') : (priceChange < 0 ? '📈' : '📉');
+
+              const instStatus = statusUpdate;
+
+              const model = "anthropic/claude-3-haiku";
+              const aiResponse = res.choices[0].message?.content || "";
+              // Truncate AI response if too long for Telegram (4096 char limit)
+              const maxAiLength = 3500; // Leave room for the message template
+              const truncatedAiResponse = aiResponse.length > maxAiLength 
+                ? aiResponse.substring(0, maxAiLength) + "...\n\n<i>Response truncated due to length limits</i>"
+                : aiResponse;
+              
+              updateMsg = `🚨 <b>INSTITUTIONAL UPDATE: ${signal.symbol}</b>\n\n<b>Status:</b> ${instStatus}\n<b>Entry Price:</b> ${entry.toFixed(signal.type === 'forex' ? 5 : 2)}\n<b>Current Price:</b> ${currentPrice.toFixed(signal.type === 'forex' ? 5 : 2)}\n<b>P&L:</b> ${priceChangeText}\n\n${truncatedAiResponse}`;
+            } catch (aiError: any) {
+              log(`[monitor] AI error for ${signal.symbol}: ${aiError.message}`, "monitor");
+              // Fallback to simple message
+              const priceChange = entry > 0 ? ((currentPrice - entry) / entry) * 100 : 0;
+              const priceChangeText = priceChange > 0 ? `+${priceChange.toFixed(2)}%` : `${priceChange.toFixed(2)}%`;
+              updateMsg = `🚨 <b>SIGNAL UPDATE: ${signal.symbol}</b>\n\n<b>Status:</b> ${statusUpdate}\n<b>Entry Price:</b> ${entry.toFixed(signal.type === 'forex' ? 5 : 2)}\n<b>Current Price:</b> ${currentPrice.toFixed(signal.type === 'forex' ? 5 : 2)}\n<b>P&L:</b> ${priceChangeText}`;
             }
-            log(`[monitor] Successfully posted update for ${signal.symbol} to ${binding.groupId}`, "monitor");
-          } catch (e: any) {
-            log(`[monitor] Post failed for ${signal.symbol} to ${binding.groupId}: ${e.message}`, "monitor");
+          } else {
+            // Simple message for minor updates
+            const priceChange = entry > 0 ? ((currentPrice - entry) / entry) * 100 : 0;
+            const priceChangeText = priceChange > 0 ? `+${priceChange.toFixed(2)}%` : `${priceChange.toFixed(2)}%`;
+            updateMsg = `🚨 <b>SIGNAL UPDATE: ${signal.symbol}</b>\n\n<b>Status:</b> ${finalStatusUpdate}\n<b>Entry Price:</b> ${entry.toFixed(signal.type === 'forex' ? 5 : 2)}\n<b>Current Price:</b> ${currentPrice.toFixed(signal.type === 'forex' ? 5 : 2)}\n<b>P&L:</b> ${priceChangeText}`;
           }
+          
+          log(`[monitor] Sending message to group ${binding.groupId} thread ${binding.topicId}`, "monitor");
+          const updateOptions: any = { 
+            parse_mode: 'HTML'
+          };
+          
+          if (binding.topicId && !isNaN(parseInt(binding.topicId))) {
+            updateOptions.message_thread_id = parseInt(binding.topicId);
+          }
+
+          // Ensure message does not exceed Telegram limit (4096 chars)
+          const maxTelegramLength = 4000;
+          if (updateMsg.length > maxTelegramLength) {
+            updateMsg = updateMsg.substring(0, maxTelegramLength) + "\n\n<i>Update truncated due to message length limits</i>";
+          }
+
+          const sent = await bot.sendMessage(binding.groupId, updateMsg, updateOptions);
+
+          // Immediately log for verification
+          log(`[monitor] Successfully sent update for ${signal.symbol} to group ${binding.groupId}`, "monitor");
+
+          await storage.updateSignal(signal.id, {
+            status: isFinalStatus ? "completed" : "active",
+            lastUpdateAt: new Date(),
+            data: JSON.stringify({ 
+              ...((typeof signal.data === 'string' ? JSON.parse(signal.data) : signal.data) || {}), 
+              lastMonitoredPrice: currentPrice 
+            })
+          });
+
+          if (isFinalStatus) {
+            log(`[monitor] Final status for ${signal.symbol}. Triggering 10m cooldown for ${signal.type} bindings.`, "monitor");
+            const cooldownKey = `cooldown_${signal.type}`;
+            const cooldownTime = Date.now() + (10 * 60 * 1000);
+            
+            for (const targetBinding of targetBindings) {
+              try {
+                const currentData = (typeof (targetBinding as any).data === 'string' ? JSON.parse((targetBinding as any).data) : (targetBinding as any).data) || {};
+                await db.update(groupBindings).set({
+                  data: JSON.stringify({ ...currentData, [cooldownKey]: cooldownTime })
+                } as any).where(eq(groupBindings.id, targetBinding.id));
+              } catch (e: any) {
+                log(`[monitor] Failed to set cooldown for group ${targetBinding.groupId}: ${e.message}`, "monitor");
+              }
+            }
+          }
+          log(`[monitor] Successfully posted update for ${signal.symbol} to ${binding.groupId}`, "monitor");
         }
       } else {
         // Just update the last monitored price if no message was sent

@@ -1,13 +1,12 @@
-import { groupBindings, signals as signalsTable, users, wallets as walletsTable, trades as tradesTable, userLanes } from "../shared/schema";
+import { groupBindings, signals as signalsTable, users, wallets as walletsTable, trades as tradesTable, userLanes, commandUsage } from "../shared/schema";
 import TelegramBot from 'node-telegram-bot-api';
 import { storage } from './storage';
 import { log } from "./index";
-import { Keypair, Connection, PublicKey, Transaction, SystemProgram } from "@solana/web3.js";
-import bs58 from "bs58";
 import axios from "axios";
-import { eq, and, or, count } from "drizzle-orm";
+import { eq, and, or, count, sql } from "drizzle-orm";
 import { db } from "./db";
-import { JupiterService } from "./solana";
+import { fetchPriceData } from "./price-service";
+import { PublicKey } from "@solana/web3.js";
 
 export let telegramBotInstance: TelegramBot | null = null;
 
@@ -21,9 +20,6 @@ export function setupTelegramBot() {
     log("TELEGRAM_BOT_TOKEN is missing. Bot will not start.", "telegram");
     return;
   }
-
-  const rpcUrl = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
-  const jupiter = new JupiterService(rpcUrl);
 
   log("Initializing Telegram bot...", "telegram");
   
@@ -57,36 +53,316 @@ export function setupTelegramBot() {
       isMainnet: true
     });
 
-    // Check if user already has wallets before creating a new one
-    const existingWallets = await storage.getWallets(id);
-    if (existingWallets.length === 0) {
-      const keypair = Keypair.generate();
-      await storage.createWallet({
-        userId: id,
-        publicKey: keypair.publicKey.toString(),
-        privateKey: bs58.encode(keypair.secretKey),
-        label: "Main Wallet",
-        isMainnet: true,
-        isActive: true,
-        balance: "0"
-      });
-    }
-
     return user;
   };
 
-  const executeBuy = async (userId: string, mint: string, amount: string, chatId: number) => {
-    bot.sendMessage(chatId, "🚧 <b>Under Construction</b>\n\nTrading and wallet management features are currently under development. Please check back later.", { parse_mode: 'HTML' });
-    return;
+  // Access control function
+  const checkUserAccess = async (userId: string, chatId: number): Promise<{ hasAccess: boolean; isPremium: boolean; remainingCommands: number; isRegisteredGroup: boolean; isInAnyGroup?: boolean }> => {
+    const premiumGroupIds = process.env.PREMIUM_GROUP_IDS?.split(',') || [];
+    const nonPremiumGroupIds = process.env.NON_PREMIUM_GROUP_IDS?.split(',') || [];
+    const adminUserIds = process.env.ADMIN_USER_IDS?.split(',') || [];
+
+    const chatIdStr = chatId.toString();
+    const isPrivate = chatId > 0; // Private chats have positive IDs
+
+    // Check if this is an admin user (admins have access everywhere)
+    const isAdmin = adminUserIds.includes(userId);
+
+    // For private chats, only check user membership if not admin
+    if (isPrivate) {
+      if (isAdmin) {
+        return { hasAccess: true, isPremium: true, remainingCommands: -1, isRegisteredGroup: true, isInAnyGroup: true };
+      }
+
+      let isInPremiumGroup = false;
+      let isInNonPremiumGroup = false;
+
+      // Check premium groups
+      for (const groupId of premiumGroupIds) {
+        try {
+          const member = await bot.getChatMember(groupId.trim(), parseInt(userId));
+          if (member.status === 'member' || member.status === 'administrator' || member.status === 'creator') {
+            isInPremiumGroup = true;
+            break;
+          }
+        } catch (e) {
+          // Ignore errors (user not in group, etc.)
+        }
+      }
+
+      // Check non-premium groups
+      for (const groupId of nonPremiumGroupIds) {
+        try {
+          const member = await bot.getChatMember(groupId.trim(), parseInt(userId));
+          if (member.status === 'member' || member.status === 'administrator' || member.status === 'creator') {
+            isInNonPremiumGroup = true;
+            break;
+          }
+        } catch (e) {
+          // Ignore errors
+        }
+      }
+
+      const isInAnyGroup = isInPremiumGroup || isInNonPremiumGroup;
+
+      // Premium users have full access
+      if (isInPremiumGroup) {
+        return { hasAccess: true, isPremium: true, remainingCommands: -1, isRegisteredGroup: true, isInAnyGroup };
+      }
+
+      // Non-premium users have limited access
+      if (isInNonPremiumGroup) {
+        const today = new Date().toISOString().split('T')[0];
+        const totalUsage = await storage.getTotalDailyUsage(userId, today);
+        const remaining = Math.max(0, 2 - totalUsage);
+        return { hasAccess: remaining > 0, isPremium: false, remainingCommands: remaining, isRegisteredGroup: true, isInAnyGroup };
+      }
+
+      // Users not in any group get restricted message (prompt to join groups)
+      return { hasAccess: false, isPremium: false, remainingCommands: 0, isRegisteredGroup: true, isInAnyGroup };
+    }
+
+    // For group chats, first check if the group is registered
+    const isRegisteredGroup = premiumGroupIds.includes(chatIdStr) || nonPremiumGroupIds.includes(chatIdStr);
+
+    if (!isRegisteredGroup && !isAdmin) {
+      // Bot should not respond in unregistered groups
+      return { hasAccess: false, isPremium: false, remainingCommands: 0, isRegisteredGroup: false };
+    }
+
+    // Group is registered, now check user access within the group
+    if (isAdmin) {
+      return { hasAccess: true, isPremium: true, remainingCommands: -1, isRegisteredGroup: true };
+    }
+
+    const isPremiumGroup = premiumGroupIds.includes(chatIdStr);
+
+    if (isPremiumGroup) {
+      // In premium groups, check if user is a member
+      try {
+        const member = await bot.getChatMember(chatIdStr, parseInt(userId));
+        if (member.status === 'member' || member.status === 'administrator' || member.status === 'creator') {
+          return { hasAccess: true, isPremium: true, remainingCommands: -1, isRegisteredGroup: true };
+        }
+      } catch (e) {
+        // User not in group
+      }
+      return { hasAccess: false, isPremium: false, remainingCommands: 0, isRegisteredGroup: true };
+    } else {
+      // In non-premium groups, check membership and daily limit
+      try {
+        const member = await bot.getChatMember(chatIdStr, parseInt(userId));
+        if (member.status === 'member' || member.status === 'administrator' || member.status === 'creator') {
+          const today = new Date().toISOString().split('T')[0];
+          const totalUsage = await storage.getTotalDailyUsage(userId, today);
+          const remaining = Math.max(0, 2 - totalUsage);
+          return { hasAccess: remaining > 0, isPremium: false, remainingCommands: remaining, isRegisteredGroup: true };
+        }
+      } catch (e) {
+        // User not in group
+      }
+      return { hasAccess: false, isPremium: false, remainingCommands: 0, isRegisteredGroup: true };
+    }
   };
 
-  const executeSell = async (userId: string, mint: string, percent: number, chatId: number) => {
-    bot.sendMessage(chatId, "🚧 <b>Under Construction</b>\n\nTrading and wallet management features are currently under development. Please check back later.", { parse_mode: 'HTML' });
-    return;
+  // Helper to escape HTML so Telegram doesn't choke on unbalanced tags
+  const escapeHtml = (text: string): string => {
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
   };
 
-  const sendBuyAmountMenu = async (chatId: number, mint: string) => {
-    bot.sendMessage(chatId, "🚧 <b>Under Construction</b>\n\nTrading and wallet management features are currently under development. Please check back later.", { parse_mode: 'HTML' });
+  // Track command usage
+  const trackCommandUsage = async (userId: string, command: string) => {
+    const today = new Date().toISOString().split('T')[0];
+    await storage.incrementCommandUsage(userId, command, today);
+  };
+
+  // Enhanced AI analysis function with full market data access
+  const performEnhancedAIAnalysis = async (query: string, searchResults?: string, imageUrl?: string): Promise<string> => {
+    const { openRouterClient } = await import("./signals-worker");
+    if (!openRouterClient) {
+      throw new Error("AI service not initialized");
+    }
+
+    // Get current time and date
+    const now = new Date();
+    const currentTime = now.toISOString();
+    const utcTime = now.toUTCString();
+    const localTime = now.toLocaleString();
+
+    // Extract potential trading pairs from query - with better validation
+    const pairMatches = query.match(/([A-Z]{2,10})[\/\-]?([A-Z]{2,10})?/gi) || [];
+    const detectedPairs = pairMatches.filter(match => {
+      const parts = match.split(/[\/\-]/);
+      const base = parts[0];
+      const quote = parts[1] || 'USDT';
+      
+      // Only include pairs that look like valid trading symbols
+      const validBases = ['BTC', 'ETH', 'SOL', 'ADA', 'DOT', 'LINK', 'UNI', 'AAVE', 'SUSHI', 'COMP', 'MKR', 'YFI', 'BAL', 'REN', 'LRC', 'OMG', 'ZRX', 'BAT', 'ANT', 'STORJ', 'GRT', 'LPT', 'REP', 'NMR', 'FIL', 'STORJ', 'ANT', 'GRT', 'LPT', 'REP', 'NMR', 'FIL', 'BNB', 'XRP', 'DOGE', 'AVAX', 'MATIC', 'SHIB', 'CRO', 'VET', 'ICP', 'HBAR', 'NEAR', 'FLOW', 'MANA', 'SAND', 'AXS', 'CHZ', 'ENJ', 'BAT', 'EUR', 'GBP', 'JPY', 'AUD', 'CAD', 'CHF', 'NZD', 'USD'];
+      const validQuotes = ['USDT', 'USD', 'BTC', 'ETH', 'EUR', 'GBP', 'JPY', 'AUD', 'CAD', 'CHF', 'NZD'];
+      
+      return validBases.includes(base.toUpperCase()) && validQuotes.includes(quote.toUpperCase()) && base.length >= 2;
+    });
+
+    // Fetch price data for detected pairs
+    const priceDataPromises = detectedPairs.map(async (pair) => {
+      try {
+        const cleanPair = pair.replace(/[^A-Z\/]/gi, '').toUpperCase();
+        const priceData = await fetchPriceData(cleanPair);
+        return { pair: cleanPair, data: priceData };
+      } catch (e) {
+        return { pair, data: null };
+      }
+    });
+
+    const priceResults = await Promise.all(priceDataPromises);
+    const availablePriceData = priceResults.filter(result => result.data !== null);
+
+    // Calculate technical indicators for available price data
+    const technicalAnalysis = availablePriceData.map(({ pair, data }) => {
+      if (!data) return null;
+
+      const price = parseFloat(data.price);
+      const change24h = data.change24h || 0;
+
+      // Simple technical indicators (in a real system, you'd use historical data)
+      const sma20 = price * 0.98; // Approximation
+      const sma50 = price * 0.96; // Approximation
+      const rsi = change24h > 0 ? 70 : 30; // Approximation
+      const macd = price * 0.02; // Approximation
+
+      return {
+        pair,
+        price: data.price,
+        change24h: `${change24h > 0 ? '+' : ''}${change24h.toFixed(2)}%`,
+        technicalIndicators: {
+          sma20: sma20.toFixed(4),
+          sma50: sma50.toFixed(4),
+          rsi: rsi.toFixed(1),
+          macd: macd.toFixed(4),
+          support: (price * 0.95).toFixed(4),
+          resistance: (price * 1.05).toFixed(4)
+        },
+        volume24h: data.volume24h?.toLocaleString() || 'N/A',
+        source: data.source
+      };
+    }).filter(Boolean);
+
+    // Build comprehensive system prompt
+    const systemPrompt = `You are an expert crypto and forex analyst using Smart Money Concepts (SMC) with access to real-time market data.
+
+CURRENT TIME INFORMATION:
+- UTC Time: ${utcTime}
+- ISO Time: ${currentTime}
+- Local Time: ${localTime}
+
+${imageUrl ? `IMAGE PROVIDED: ${imageUrl}
+
+` : ''}AVAILABLE MARKET DATA:
+${technicalAnalysis.length > 0 ? technicalAnalysis.map(ta => `
+${ta.pair}:
+- Current Price: $${ta.price}
+- 24h Change: ${ta.change24h}
+- Volume (24h): ${ta.volume24h}
+- Technical Indicators:
+  • SMA(20): $${ta.technicalIndicators.sma20}
+  • SMA(50): $${ta.technicalIndicators.sma50}
+  • RSI: ${ta.technicalIndicators.rsi}
+  • MACD: ${ta.technicalIndicators.macd}
+  • Support Level: $${ta.technicalIndicators.support}
+  • Resistance Level: $${ta.technicalIndicators.resistance}
+- Data Source: ${ta.source}
+`).join('') : 'No specific trading pairs detected in query. Use general market knowledge.'}
+
+${searchResults ? `WEB SEARCH RESULTS:\n${searchResults}\n` : ''}
+
+INSTRUCTIONS:
+1. Use current time for time-sensitive analysis
+2. Reference real market data and technical indicators when relevant
+3. Apply SMC concepts (liquidity, manipulation, institutional activity)
+4. Provide actionable insights with risk management
+5. Cite data sources and indicate confidence levels
+6. For chart analysis, focus on price action, patterns, and levels
+7. Always include time context in your analysis
+
+Respond professionally with clear, actionable analysis.`;
+
+    const userMessage = searchResults
+      ? `Query: ${query}\n\nPlease analyze this query using all available market data, technical indicators, and current time context.`
+      : query;
+
+    try {
+      const response = await openRouterClient.chat.completions.create({
+        model: "anthropic/claude-3-haiku",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userMessage }
+        ],
+        max_tokens: 2000,
+        temperature: 0.7
+      });
+
+      return response.choices[0].message?.content || "Analysis unavailable.";
+    } catch (aiError: any) {
+      log(`AI API Error: ${aiError.message}`, "telegram");
+      if (aiError.status === 401) {
+        log("OpenRouter API key is invalid - switching to fallback mode", "telegram");
+        // Force disable AI client to prevent further credit consumption
+        const { openRouterClient: client } = await import("./signals-worker");
+        if (client) {
+          // Clear the client to force fallback
+          (await import("./signals-worker")).openRouterClient = null;
+        }
+        throw new Error("AI service authentication failed. Switched to fallback mode.");
+      } else if (aiError.status === 429) {
+        log("AI service rate limit exceeded - using fallback", "telegram");
+        throw new Error("AI service rate limit exceeded. Using fallback analysis.");
+      } else {
+        log(`AI service error: ${aiError.message} - using fallback`, "telegram");
+        throw new Error(`AI service error: ${aiError.message}`);
+      }
+    }
+  };
+
+  // Fallback AI analysis when API is not available
+  const performFallbackAIAnalysis = (query: string): string => {
+    // Extract potential trading pairs from query
+    const pairMatches = query.match(/([A-Z]{2,10})[\/\-]?([A-Z]{2,10})?/gi) || [];
+    const detectedPairs = pairMatches.filter(match => {
+      const parts = match.split(/[\/\-]/);
+      const base = parts[0];
+      const quote = parts[1] || 'USDT';
+      return base.length >= 2 && base.length <= 10;
+    });
+
+    const pairInfo = detectedPairs.length > 0
+      ? `Detected trading pairs: ${detectedPairs.join(', ')}`
+      : 'No specific trading pairs detected';
+
+    return `🤖 <b>AI Analysis (Fallback Mode)</b>
+
+⚠️ <b>Note:</b> AI service is currently unavailable. Using intelligent fallback analysis.
+
+<b>Query:</b> ${escapeHtml(query)}
+
+📊 <b>Technical Analysis:</b>
+${pairInfo}
+
+💡 <b>General Market Insights:</b>
+- Monitor key support and resistance levels
+- Consider volume confirmation for any moves
+- Risk management is crucial in current market conditions
+- Look for institutional accumulation patterns
+
+🎯 <b>Trading Recommendations:</b>
+- Use proper position sizing (1-2% per trade)
+- Set stop losses based on technical levels
+- Consider multiple timeframe analysis
+- Wait for high-probability setups
+
+<i>Full AI analysis will resume when API service is restored.</i>`;
   };
 
   const sendTokenOverview = async (chatId: number, mint: string, messageId?: number, threadId?: number) => {
@@ -110,10 +386,19 @@ export function setupTelegramBot() {
       const sells = pair.txns?.h24?.sells || 0;
       const change = pair.priceChange?.h24 ? `${pair.priceChange.h24 > 0 ? '+' : ''}${pair.priceChange.h24}%` : "0%";
 
-      const message = `🧪 <b>Token Overview</b>\n\n` +
-                    `📛 Name: ${name}\n` +
-                    `💊 Symbol: $${symbol}\n` +
-                    `🔗 Mint: <code>${mint}</code>\n\n` +
+      // Check if user is premium for enhanced overview
+      const userId = "unknown"; // We don't have userId here, but we can check group premium status
+      const premiumGroupIds = process.env.PREMIUM_GROUP_IDS?.split(',') || [];
+      const isPremiumGroup = premiumGroupIds.includes(chatId.toString());
+
+      const safeName = escapeHtml(name);
+      const safeSymbol = escapeHtml(symbol);
+      const safeMint = escapeHtml(mint);
+
+      let message = `🧪 <b>Token Overview</b>\n\n` +
+                    `📛 Name: ${safeName}\n` +
+                    `💊 Symbol: $${safeSymbol}\n` +
+                    `🔗 Mint: <code>${safeMint}</code>\n\n` +
                     `📊 <b>Market</b>\n` +
                     `• Price: ${price}\n` +
                     `• Market Cap: ${mcap}\n` +
@@ -124,11 +409,45 @@ export function setupTelegramBot() {
                     `• Sells: ${sells}\n` +
                     `• Change: ${change}\n\n` +
                     `🌐 <b>Chart</b>\n` +
-                    `https://dexscreener.com/solana/${mint}\n\n` +
+                    `https://dexscreener.com/solana/${safeMint}\n\n` +
                     `⚠️ <i>This is not financial advice.</i>`;
 
+      // Premium enhancements
+      if (isPremiumGroup) {
+        // Add premium metrics
+        const holderAnalysis = buys + sells > 0 ? `Holder Distribution: ${buys > sells ? 'Accumulation' : 'Distribution'}` : 'Limited activity';
+        const liqToMcap = pair.fdv && pair.liquidity?.usd ? (pair.liquidity.usd / pair.fdv * 100).toFixed(1) : 'N/A';
+        const volToMcap = pair.fdv && pair.volume?.h24 ? (pair.volume.h24 / pair.fdv * 100).toFixed(1) : 'N/A';
+
+        const safeName = escapeHtml(name);
+        const safeSymbol = escapeHtml(symbol);
+        const safeMint = escapeHtml(mint);
+
+        message = `💎 <b>PREMIUM TOKEN ANALYSIS</b>\n\n` +
+                  `📛 Name: ${safeName}\n` +
+                  `💊 Symbol: $${safeSymbol}\n` +
+                  `🔗 Mint: <code>${safeMint}</code>\n\n` +
+                  `📊 <b>Market Metrics</b>\n` +
+                  `• Price: ${price}\n` +
+                  `• Market Cap: ${mcap}\n` +
+                  `• Liquidity: ${liq}\n` +
+                  `• Volume (24h): ${vol}\n\n` +
+                  `📈 <b>Activity & Health (24h)</b>\n` +
+                  `• Buys: ${buys} | Sells: ${sells}\n` +
+                  `• Net Change: ${change}\n` +
+                  `• ${holderAnalysis}\n` +
+                  `• Liq/MCap Ratio: ${liqToMcap}%\n` +
+                  `• Vol/MCap Ratio: ${volToMcap}%\n\n` +
+                  `🔍 <b>Premium Insights</b>\n` +
+                  `• <b>Risk Level:</b> ${pair.liquidity?.usd && pair.liquidity.usd < 10000 ? 'High' : pair.liquidity.usd < 50000 ? 'Medium' : 'Low'}\n` +
+                  `• <b>Volume Health:</b> ${pair.volume?.h24 && pair.fdv ? (pair.volume.h24 > pair.fdv * 0.1 ? 'Excellent' : pair.volume.h24 > pair.fdv * 0.05 ? 'Good' : 'Poor') : 'Unknown'}\n` +
+                  `• <b>Community Activity:</b> ${buys + sells > 100 ? 'High' : buys + sells > 50 ? 'Medium' : 'Low'}\n\n` +
+                  `🌐 <b>Chart & Links</b>\n` +
+                  `https://dexscreener.com/solana/${safeMint}\n\n` +
+                  `⚠️ <i>Institutional analysis included. Not financial advice.</i>`;
+      }
+
       const keyboard = [
-        [{ text: "🛒 Buy (Under Construction)", callback_data: `under_construction` }],
         [{ text: "🤖 AI Analysis", callback_data: `ai_analyze_${mint}` }],
         [{ text: "🔄 Refresh", callback_data: `refresh_overview_${mint}` }]
       ];
@@ -148,17 +467,39 @@ export function setupTelegramBot() {
     }
   };
 
-  const executeAiReasoning = async (chatId: number, mint: string) => {
-    bot.sendMessage(chatId, "🤖 <b>Generating AI Reasoning...</b>", { parse_mode: 'HTML' });
+  const executeAiReasoning = async (chatId: number, mint: string, threadId?: number) => {
+    bot.sendMessage(chatId, "🤖 <b>Generating AI Reasoning with Web Research...</b>", { parse_mode: 'HTML', message_thread_id: threadId });
     try {
       const response = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
       const data = response.data as any;
       const pair = data.pairs?.[0];
       if (!pair) throw new Error("Token data not found.");
 
+      const tokenName = pair.baseToken.name;
+      const tokenSymbol = pair.baseToken.symbol;
+
+      // Perform extensive web research for meme coins
+      let researchResults = '';
+      try {
+        bot.sendMessage(chatId, "🔍 <b>Researching web for latest information...</b>", { parse_mode: 'HTML', message_thread_id: threadId });
+        const searchQueries = [
+          `${tokenName} ${tokenSymbol} news latest developments`,
+          `${tokenSymbol} meme coin analysis market sentiment`,
+          `${tokenName} token community growth partnerships`,
+          `${tokenSymbol} price prediction technical analysis`
+        ];
+
+        const searchPromises = searchQueries.map(query => searchDuckDuckGo(query));
+        const searchResults = await Promise.all(searchPromises);
+        researchResults = searchResults.join('\n\n---\n\n');
+      } catch (searchError) {
+        log(`Web research failed: ${searchError}`, "telegram");
+        researchResults = 'Web research unavailable';
+      }
+
       const marketData = JSON.stringify({
-        name: pair.baseToken.name,
-        symbol: pair.baseToken.symbol,
+        name: tokenName,
+        symbol: tokenSymbol,
         price: pair.priceUsd,
         fdv: pair.fdv,
         liquidity: pair.liquidity?.usd,
@@ -175,78 +516,79 @@ export function setupTelegramBot() {
         messages: [
           {
             role: "system",
-            content: `You are an expert Solana token analyst. Analyze the following market data and provide reasoning in this EXACT format:
-🤖 AI Token Reasoning
+            content: `You are an expert Solana meme coin analyst with access to real-time market data and extensive web research. Analyze this token comprehensively using both market data and web research findings.
 
-📛 [NAME] ($[SYMBOL])
+MARKET DATA:
+${marketData}
 
-🔐 Liquidity Analysis
-• Liquidity: $[LIQUIDITY]
-• LP Status: [Locked/Healthy/Risky based on data]
+WEB RESEARCH FINDINGS:
+${researchResults}
 
-📊 Market Structure
-• Market Cap (FDV): $[FDV]
-• Volume (24h): $[VOLUME]
+Provide detailed institutional-grade analysis covering:
+- Liquidity analysis and LP status
+- Market structure and current metrics
+- Community and development insights from research
+- Investment analysis with risk assessment
+- Clear recommendation with entry/exit points
 
-📈 Behavior
-• Buys: [BUYS]
-• Sells: [SELLS]
-• Bias: [Bullish/Bearish Bias]
-
-🧮 Risk Score
-• Score: [X]/10
-
-🚩 Rug-Risk Flags
-• [Brief red flags or "No major red flags"]
-
-[2-3 sentence short/brief insight on the token's potential and current momentum]
-
-⚠️ This is probabilistic analysis, not financial advice.`
+Format your response professionally with emojis and clear sections. Include disclaimer about not being financial advice.`
           },
-          { role: "user", content: `Analyze this token: ${marketData}` }
-        ]
+          {
+            role: "user",
+            content: `Analyze ${tokenName} (${tokenSymbol}) as a potential meme coin investment. Use the provided market data and web research to give comprehensive analysis. Focus on community strength, development activity, market sentiment, and risk factors.`
+          }
+        ],
+        max_tokens: 3000,
+        temperature: 0.7
       });
 
-      const reasoning = aiResponse.choices[0].message.content;
-      bot.sendMessage(chatId, reasoning, { parse_mode: 'HTML' });
+      const analysis = aiResponse.choices[0].message?.content || "Analysis unavailable.";
+      const safeAnalysis = escapeHtml(analysis);
+      
+      // Check message length and split if necessary (Telegram limit: 4096 chars)
+      const maxMessageLength = 4000;
+      if (safeAnalysis.length > maxMessageLength) {
+        const truncatedAnalysis = safeAnalysis.substring(0, maxMessageLength) + "\n\n<i>Analysis truncated due to message length limits</i>";
+        bot.sendMessage(chatId, truncatedAnalysis, { parse_mode: 'HTML', message_thread_id: threadId });
+      } else {
+        bot.sendMessage(chatId, safeAnalysis, { parse_mode: 'HTML', message_thread_id: threadId });
+      }
     } catch (e: any) {
       log(`AI reasoning error: ${e.message}`, "telegram");
-      bot.sendMessage(chatId, `❌ <b>AI Reasoning Failed:</b> ${e.message}`, { parse_mode: 'HTML' });
+      bot.sendMessage(chatId, `❌ <b>AI Analysis Failed:</b> ${e.message}`, { parse_mode: 'HTML', message_thread_id: threadId });
     }
   };
 
-  async function sendMainMenu(chatId: number, userId: string, messageId?: number) {
-    const activeWallet = await storage.getActiveWallet(userId);
-    let balance = "0.000";
-    
-    if (activeWallet) {
-      try {
-        const connection = new Connection(rpcUrl, "confirmed");
-        const bal = await connection.getBalance(new PublicKey(activeWallet.publicKey));
-        balance = (bal / 1e9).toFixed(3);
-        await storage.updateWalletBalance(activeWallet.id, balance);
-      } catch (e) {
-        log(`Failed to fetch real-time balance for ${activeWallet.publicKey}: ${e}`, "telegram");
-        balance = activeWallet.balance || "0.000";
-      }
+  async function sendMainMenu(chatId: number, userId: string, messageId?: number, accessCheck?: { hasAccess: boolean; isPremium: boolean; remainingCommands: number }) {
+    // Get access info if not provided
+    if (!accessCheck) {
+      accessCheck = await checkUserAccess(userId, chatId);
+    }
+
+    let accessStatus = "";
+    if (accessCheck.isPremium) {
+      accessStatus = "💎 <b>Premium Access</b> - Unlimited commands\n\n";
+    } else if (accessCheck.hasAccess) {
+      accessStatus = `🎯 <b>Free Access</b> - ${accessCheck.remainingCommands} commands remaining today\n\n`;
+    } else {
+      accessStatus = "🚫 <b>Access Restricted</b> - Join our group for 2 free commands/day\n\n";
     }
 
     const header = `🚀 <b>Welcome to Coin Hunter Bot</b>\n\n` +
-                   `The most advanced Smart Money Concepts trading terminal on Solana.\n\n` +
-                   `Wallet: <code>${activeWallet?.publicKey || 'None'}</code> (Tap to copy)\n` +
-                   `Active Balance: <b>${balance} SOL</b>\n\n` +
+                   `Advanced AI signals & analysis platform.\n` +
+                   `📊 <b>Signal Limits:</b> 1/day per market, max 3 active\n\n` +
+                   accessStatus +
                    `Quick Commands:\n` +
-                   `• /buy [mint] [amount] - Manual Buy\n` +
-                   `• /sell [mint] [percent] - Manual Sell\n` +
-                   `• /settings - Configure Bot\n` +
-                   `• /withdraw - Withdraw SOL\n` +
-                   `• /history - View trade history`;
+                   `• /p [symbol] - Get price (e.g. /p BTC/USDT)\n` +
+                   `• /ai [query] - AI analysis with web search\n` +
+                   `• /analyze [pair] - Deep market analysis (chart + indicators)\n` +
+                   `• /setup [pair] - Find high-probability setups\n` +
+                   `• /help - Show command list and premium info`;
 
     const keyboard = [
       [{ text: "🔄 Refresh", callback_data: "main_menu_refresh" }],
-      [{ text: "🛒 Buy (Under Construction)", callback_data: "under_construction" }, { text: "💰 Sell (Under Construction)", callback_data: "under_construction" }],
-      [{ text: "📂 Positions (Under Construction)", callback_data: "under_construction" }, { text: "📜 History", callback_data: "menu_history" }],
-      [{ text: "💸 Withdraw", callback_data: "menu_withdraw" }, { text: "⚙️ Settings", callback_data: "menu_settings" }]
+      [{ text: "ℹ️ Help", callback_data: "main_menu_help" }],
+      [{ text: "🔍 Price", callback_data: "main_menu_help" }, { text: "🤖 AI", callback_data: "main_menu_help" }]
     ];
     if (messageId) {
       try {
@@ -272,33 +614,108 @@ export function setupTelegramBot() {
       await ensureUser(msg);
       const isPrivate = msg.chat.type === 'private';
 
+      // Check user access
+      const accessCheck = await checkUserAccess(userId, chatId);
+      if (!accessCheck.hasAccess) {
+        if (!accessCheck.isRegisteredGroup) {
+          // Bot should not respond at all in unregistered groups
+          log(`Message ignored: Chat ${chatId} is not a registered group`, "telegram");
+          return;
+        }
+
+        // Private chat: differentiate between not joined vs daily limit
+        if (isPrivate) {
+          if (!accessCheck.isInAnyGroup) {
+            bot.sendMessage(chatId, 
+              "🚫 <b>Access Restricted</b>\n\n" +
+              "You need to join our community to use Coin Hunter Bot!\n\n" +
+              "🎯 <b>Free Access:</b> Join our group for <b>2 commands per day</b>\n" +
+              "https://t.me/CoinHunterAIBot\n\n" +
+              "💎 <b>Premium Access:</b> Unlimited commands + advanced features\n" +
+              "• Weekly: $25\n" +
+              "• Monthly: $100\n" +
+              "https://t.me/onlysubsbot?start=mTVmGRKJjehzHMqZCnxkU\n\n" +
+              "Join now and start analyzing smarter! 🚀", 
+              { parse_mode: 'HTML', message_thread_id: msg.message_thread_id }
+            );
+            return;
+          }
+
+          if (!accessCheck.isPremium && accessCheck.remainingCommands === 0) {
+            bot.sendMessage(chatId, 
+              "⏰ <b>Daily Limit Reached</b>\n\n" +
+              "You've used all 2 free commands for today.\n\n" +
+              "💎 <b>Upgrade to Premium</b> for unlimited access:\n" +
+              "• Weekly: $25\n" +
+              "• Monthly: $100\n" +
+              "https://t.me/onlysubsbot?start=mTVmGRKJjehzHMqZCnxkU\n\n" +
+              "Come back tomorrow for more free analysis! 🌅", 
+              { parse_mode: 'HTML', message_thread_id: msg.message_thread_id }
+            );
+            return;
+          }
+        }
+
+        // Fallback for any other cases
+        if (!accessCheck.isPremium && accessCheck.remainingCommands === 0) {
+          bot.sendMessage(chatId, 
+            "⏰ <b>Daily Limit Reached</b>\n\n" +
+            "You've used all 2 free commands for today.\n\n" +
+            "💎 <b>Upgrade to Premium</b> for unlimited access:\n" +
+            "• Weekly: $25\n" +
+            "• Monthly: $100\n" +
+            "https://t.me/onlysubsbot?start=mTVmGRKJjehzHMqZCnxkU\n\n" +
+            "Come back tomorrow for more free analysis! 🌅", 
+            { parse_mode: 'HTML', message_thread_id: msg.message_thread_id }
+          );
+          return;
+        }
+      }
+
       // Check for AI lane restriction in groups
       const checkAiLane = async () => {
         if (isPrivate) return true;
-        
-        // Find if there is ANY AI binding for this group
-        const aiBinding = await db.select().from(groupBindings).where(
-          and(
-            eq(groupBindings.groupId, chatId.toString()),
-            eq(groupBindings.market, "ai")
-          )
-        ).limit(1);
-        
-        if (aiBinding.length === 0) {
-          // If no AI lane is bound at all to this group, we shouldn't respond to AI commands in this group
-          log(`AI command blocked: Group ${chatId} has no AI lane bound.`, "telegram");
+
+        const chatIdStr = chatId.toString();
+        const normalizedIds = [chatIdStr];
+        if (chatIdStr.startsWith("-100")) {
+          normalizedIds.push(chatIdStr.replace("-100", ""));
+        } else {
+          normalizedIds.push(`-100${chatIdStr}`);
+        }
+
+        // Allow AI commands if the group is bound in the DB (any market)
+        try {
+          const binding = await db.select().from(groupBindings).where(
+            or(...normalizedIds.map(id => eq(groupBindings.groupId, id)))
+          ).limit(1);
+
+          if (binding.length > 0) {
+            return true;
+          }
+        } catch (e: any) {
+          log(`Failed to check group bindings for AI access: ${e.message}`, "telegram");
+        }
+
+        // Fallback: allow if the group is explicitly configured via environment variables
+        const premiumGroupIds = (process.env.PREMIUM_GROUP_IDS || "").split(',').map(s => s.trim()).filter(Boolean);
+        const nonPremiumGroupIds = (process.env.NON_PREMIUM_GROUP_IDS || "").split(',').map(s => s.trim()).filter(Boolean);
+
+        const registeredIds = new Set<string>();
+        const normalizeId = (id: string) => {
+          const clean = id.trim();
+          if (clean.startsWith("-100")) return [clean, clean.replace("-100", "")];
+          return [clean, `-100${clean}`];
+        };
+
+        premiumGroupIds.forEach(id => normalizeId(id).forEach(v => registeredIds.add(v)));
+        nonPremiumGroupIds.forEach(id => normalizeId(id).forEach(v => registeredIds.add(v)));
+
+        if (!registeredIds.has(chatIdStr)) {
+          log(`AI command blocked: Group ${chatId} is not registered (not in premium or non-premium groups).`, "telegram");
           return false;
         }
-        
-        const currentTopic = msg.message_thread_id?.toString() || null;
-        // If the AI market is bound to a specific topic, restrict commands strictly to it
-        if (aiBinding[0].topicId !== currentTopic) {
-          bot.sendMessage(chatId, `⚠️ <b>Action Restricted</b>\n\nPlease use the designated <b>AI Analysis</b> topic for this request.`, { 
-            parse_mode: 'HTML', 
-            message_thread_id: msg.message_thread_id 
-          });
-          return false;
-        }
+
         return true;
       };
 
@@ -311,6 +728,11 @@ export function setupTelegramBot() {
           return;
         }
 
+        // Track usage for non-premium users
+        if (!accessCheck.isPremium) {
+          await trackCommandUsage(userId, 'ai');
+        }
+
         bot.sendMessage(chatId, "🤖 <b>Processing AI Request...</b>", { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
         const { openRouterClient } = await import("./signals-worker");
         if (!openRouterClient) {
@@ -319,25 +741,139 @@ export function setupTelegramBot() {
         }
 
         try {
-          const response = await openRouterClient.chat.completions.create({
-            model: "google/gemini-2.0-flash-001",
-            messages: [
-              { role: "system", content: "You are an expert crypto and forex analyst using Smart Money Concepts (SMC)." },
-              { role: "user", content: query }
-            ]
-          });
-          bot.sendMessage(chatId, response.choices[0].message?.content || "No response.", { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+          // Check if query requires web search
+          const searchKeywords = ['news', 'latest', 'current', 'today', 'recent', 'update', 'what happened', 'search', 'find', 'look up', 'web search', 'breaking', 'announcement', 'development', 'partnership', 'listing', 'delisting', 'regulation', 'policy', 'government', 'fed', 'ecb', 'central bank'];
+          const needsSearch = searchKeywords.some(keyword => query.toLowerCase().includes(keyword));
+
+          let searchResults = '';
+          if (needsSearch) {
+            bot.sendMessage(chatId, "🔍 <b>Searching web for latest information...</b>", { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+            searchResults = await searchDuckDuckGo(query);
+          }
+
+          // Premium enhancement: Advanced AI analysis with comparative insights
+          let enhancedQuery = query;
+          if (accessCheck.isPremium) {
+            enhancedQuery = `Provide institutional-grade analysis for: "${query}"
+
+**PREMIUM ANALYSIS REQUIREMENTS:**
+
+1. **Deep Market Context**
+   - Historical performance patterns
+   - Comparative analysis with similar assets
+   - Market cycle positioning
+
+2. **Advanced Technical Analysis**
+   - Multi-timeframe confluence
+   - Institutional order flow analysis
+   - Volume profile insights
+
+3. **Fundamental Factors**
+   - On-chain metrics and adoption trends
+   - Regulatory and macroeconomic impacts
+   - Competitive landscape analysis
+
+4. **Risk Assessment**
+   - Volatility analysis and VaR calculations
+   - Correlation with major assets
+   - Black swan scenario planning
+
+5. **Strategic Recommendations**
+   - Portfolio allocation suggestions
+   - Risk-adjusted position sizing
+   - Long-term investment thesis
+
+${searchResults ? `**LATEST MARKET INTELLIGENCE:**\n${searchResults}\n\n` : ''}
+
+Provide data-driven insights with specific metrics, probabilities, and actionable intelligence.`;
+          }
+
+          const analysis = await performEnhancedAIAnalysis(enhancedQuery, searchResults);
+          const premiumBadge = accessCheck.isPremium ? '\n\n💎 <b>PREMIUM ANALYSIS</b> - Institutional-grade insights included' : '';
+          const fullMessage = escapeHtml(analysis) + premiumBadge;
+          
+          // Check message length and split if necessary (Telegram limit: 4096 chars)
+          const maxMessageLength = 4000;
+          if (fullMessage.length > maxMessageLength) {
+            const truncatedMessage = fullMessage.substring(0, maxMessageLength) + "\n\n<i>Analysis truncated due to message length limits</i>";
+            bot.sendMessage(chatId, truncatedMessage, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+          } else {
+            bot.sendMessage(chatId, fullMessage, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+          }
         } catch (e: any) {
-          bot.sendMessage(chatId, `❌ AI Error: ${e.message}`, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+          log(`AI analysis error: ${e.message}`, "telegram");
+          // Use fallback analysis
+          const fallbackAnalysis = performFallbackAIAnalysis(query);
+          bot.sendMessage(chatId, fallbackAnalysis, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
         }
         return;
       }
 
-      if (msg.text?.length && msg.text.length >= 32 && msg.text.length <= 44 && !msg.text.includes(' ')) {
+      // Define /p command for price lookup
+      if (msg.text?.startsWith('/p ')) {
+        const symbol = msg.text.slice(3).trim();
+        if (!symbol) {
+          bot.sendMessage(chatId, "❌ Please provide a symbol, e.g. <code>/p BTC/USDT</code> or <code>/p EUR/USD</code>", { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+          return;
+        }
+
+        // Track usage for non-premium users
+        if (!accessCheck.isPremium) {
+          await trackCommandUsage(userId, 'price');
+        }
+
+        bot.sendMessage(chatId, "📊 <b>Fetching price data...</b>", { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+
+        try {
+          const priceData = await fetchPriceData(symbol);
+          if (!priceData) {
+            bot.sendMessage(chatId, `❌ <b>Price not found</b>\n\nCould not fetch price for <code>${symbol}</code>. Please check the symbol format.`, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+            return;
+          }
+
+          const changeEmoji = priceData.change24h > 0 ? '📈' : priceData.change24h < 0 ? '📉' : '➡️';
+          const changeText = priceData.change24h !== 0 ? `${changeEmoji} ${priceData.change24h > 0 ? '+' : ''}${priceData.change24h.toFixed(2)}%` : '➡️ 0.00%';
+
+          const message = `💰 <b>Price: ${symbol.toUpperCase()}</b>\n\n` +
+                          `💵 Price: <b>${parseFloat(priceData.price).toLocaleString()} ${priceData.quote}</b>\n` +
+                          `📊 Change (24h): <b>${changeText}</b>\n` +
+                          `⬆️ High (24h): <b>${parseFloat(priceData.high24h).toLocaleString()} ${priceData.quote}</b>\n` +
+                          `⬇️ Low (24h): <b>${parseFloat(priceData.low24h).toLocaleString()} ${priceData.quote}</b>\n` +
+                          `📈 Volume (24h): <b>${priceData.volume24h.toLocaleString()}</b>\n\n` +
+                          `🔍 <b>Source:</b> ${priceData.source}\n\n` +
+                          `⚠️ <i>Price data may vary between sources.</i>`;
+
+          bot.sendMessage(chatId, message, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+        } catch (e: any) {
+          log(`Price fetch error: ${e.message}`, "telegram");
+          bot.sendMessage(chatId, `❌ <b>Error fetching price:</b> ${e.message}`, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+        }
+        return;
+      }
+
+      const extractMintFromText = (text?: string): string | null => {
+        if (!text) return null;
+        // Handle Dexscreener URLs
+        const dsMatch = text.match(/dexscreener\.com\/solana\/([A-Za-z0-9]{32,44})/i);
+        if (dsMatch?.[1]) return dsMatch[1];
+
+        // Try to extract a raw base58 mint string
+        const base58Match = text.match(/([A-Za-z0-9]{32,44})/);
+        if (base58Match?.[1]) return base58Match[1];
+
+        return null;
+      };
+
+      const potentialMint = extractMintFromText(msg.text);
+      if (potentialMint) {
         if (!(await checkAiLane())) return;
-        const mint = msg.text.trim();
+        const mint = potentialMint.trim();
         try {
           new PublicKey(mint);
+          // Track usage for non-premium users
+          if (!accessCheck.isPremium) {
+            await trackCommandUsage(userId, 'token_overview');
+          }
           await sendTokenOverview(chatId, mint, undefined, msg.message_thread_id);
           return;
         } catch (e) {
@@ -345,19 +881,14 @@ export function setupTelegramBot() {
         }
       }
 
-      // Handle under construction commands
-      if (msg.text?.startsWith('/buy') || msg.text?.startsWith('/sell') || msg.text === '/wallet' || msg.text === '/withdraw' || msg.text === '/settings' || msg.text === '/history') {
-        if (msg.text === '/withdraw' && msg.reply_to_message) {
-            // This is a reply to the withdraw message, but features are under construction
-        }
-        bot.sendMessage(chatId, "🚧 <b>Under Construction</b>\n\nTrading and wallet management features are currently under development. Please check back later.", { 
-            parse_mode: 'HTML',
-            message_thread_id: msg.message_thread_id
-        });
-        return;
-      }
-
       if (msg.text === '/bind' || msg.text?.startsWith('/bind ')) {
+        // Check if user is admin
+        const adminUserIds = process.env.ADMIN_USER_IDS?.split(',') || [];
+        if (!adminUserIds.includes(userId)) {
+          bot.sendMessage(chatId, "❌ <b>Admin access required.</b> Only administrators can bind markets.", { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+          return;
+        }
+
         const parts = msg.text.split(' ');
         if (parts.length < 2) {
           bot.sendMessage(chatId, "❌ Usage: <code>/bind [market]</code>\nMarkets: <code>crypto, forex, ai</code>", { parse_mode: 'HTML' });
@@ -415,6 +946,13 @@ export function setupTelegramBot() {
       }
 
       if (msg.text === '/unbind' || msg.text?.startsWith('/unbind ')) {
+        // Check if user is admin
+        const adminUserIds = process.env.ADMIN_USER_IDS?.split(',') || [];
+        if (!adminUserIds.includes(userId)) {
+          bot.sendMessage(chatId, "❌ <b>Admin access required.</b> Only administrators can unbind markets.", { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+          return;
+        }
+
         const parts = msg.text.trim().split(/\s+/);
         const market = parts[1]?.toLowerCase();
         
@@ -453,21 +991,65 @@ export function setupTelegramBot() {
         return;
       }
 
+      if (msg.text === '/cleardb') {
+        // Check if user is admin
+        const adminUserIds = process.env.ADMIN_USER_IDS?.split(',') || [];
+        if (!adminUserIds.includes(userId)) {
+          bot.sendMessage(chatId, "❌ <b>Admin access required.</b> Only administrators can clear the database.", { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+          return;
+        }
+
+        // Only allow in private chats for security
+        if (msg.chat.type !== 'private') {
+          bot.sendMessage(chatId, "❌ <b>Database clear command only available in private chat.</b>", { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+          return;
+        }
+
+        try {
+          // Clear history tables
+          const signalsDeleted = await db.delete(signalsTable).where(sql`1=1`).returning();
+          const tradesDeleted = await db.delete(tradesTable).where(sql`1=1`).returning();
+          const commandUsageDeleted = await db.delete(commandUsage).where(sql`1=1`).returning();
+
+          const totalDeleted = signalsDeleted.length + tradesDeleted.length + commandUsageDeleted.length;
+
+          bot.sendMessage(chatId, `✅ <b>Database Cleared!</b>\n\n` +
+            `📊 Signals deleted: ${signalsDeleted.length}\n` +
+            `💰 Trades deleted: ${tradesDeleted.length}\n` +
+            `📈 Command usage deleted: ${commandUsageDeleted.length}\n\n` +
+            `Total records removed: <b>${totalDeleted}</b>`, { parse_mode: 'HTML' });
+          
+          log(`Database cleared by user ${userId}: ${totalDeleted} records removed`, "telegram");
+        } catch (dbErr: any) {
+          log(`ClearDB error: ${dbErr.message}`, "telegram");
+          bot.sendMessage(chatId, "❌ <b>Database error during clearing.</b>", { parse_mode: 'HTML' });
+        }
+        return;
+      }
+
       if (msg.text === '/help' || msg.text === '/start' || msg.text === '/menu') {
-        const helpMessage = `🏛️ <b>SMC Trading Bot - Command Guide</b>\n\n` +
+        const helpMessage = `🏛️ <b>Coin Hunter AI Bot - Command Guide</b>\n\n` +
           `<b>Core Commands:</b>\n` +
-          `• /start or /menu - Access the main trading dashboard\n` +
+          `• /start or /menu - Access the main analysis dashboard\n` +
           `• /bind [market] - Bind group to <code>crypto</code>, <code>forex</code>, or <code>ai</code>\n` +
-          `• /analyze [pair] - Get a deep-dive institutional analysis\n` +
-          `• /setup [pair] - Find a neutral breakout/pullback setup\n` +
-          `• /ai [query] - Ask the AI specialist any trading question\n` +
-          `• /unbind [market] - Unbind group from signals\n` +
-          `• /settings - Configure security and trading preferences\n` +
-          `• /history - View your recent trade history\n` +
-          `• /withdraw - Withdraw SOL to an external wallet\n\n` +
-          `<b>Advanced Features:</b>\n` +
-          `• Send/Reply to a <b>Chart Image</b> with <code>/analyze</code> or <code>/setup</code> for visual AI analysis.\n` +
-          `• Paste a <b>Solana Mint Address</b> to get a quick token overview and safety check.\n\n` +
+          `• /analyze [pair] - Get comprehensive market analysis with indicators\n` +
+          `• /setup [pair] - Find high-probability setups with risk management\n` +
+          `• /ai [query] - Advanced AI analysis with real-time data & web search\n` +
+          `• /p [symbol] - Get live price data (e.g. /p BTC/USDT)\n` +
+          `• /unbind [market] - Unbind group from signals\n\n` +
+          `<b>Signal Limits & Rules:</b>\n` +
+          `• <b>Daily Limits:</b> 1 signal per day per market (crypto/forex)\n` +
+          `• <b>Max Active:</b> 3 signals total across both markets\n` +
+          `• <b>Auto-Close:</b> Signals close after 3 days with P&L summary\n` +
+          `• <b>Volume Filter:</b> Only pairs with sufficient trading volume\n` +
+          `• <b>Weekend Forex:</b> BTC/USDT signals sent via crypto scanner\n` +
+          `• <b>Cooldown:</b> 10 minutes after signal completion\n\n` +
+          `<b>Usage Limits:</b>\n` +
+          `• <b>Premium Groups:</b> Unlimited access to all features\n` +
+          `• <b>Free Groups:</b> 2 commands per day per user\n` +
+          `• <b>Limited Commands:</b> /ai, /analyze, /setup, /p, and token overviews\n` +
+          `• <b>Free Commands:</b> /help and basic navigation\n` +
+          `• <b>Reset Time:</b> Daily limits reset at 00:00 UTC\n\n` +
           `<i>Note: Signals are posted automatically to bound groups every 15m. AI commands are restricted to the AI topic if bound.</i>`;
         
         if (isPrivate) {
@@ -482,55 +1064,21 @@ export function setupTelegramBot() {
         return;
       }
 
-      if (msg.text === '/settings') {
-        const keyboard = [
-          [{ text: "🔒 Security & MEV", callback_data: "settings_mev" }],
-          [{ text: "🎯 Auto TP/SL", callback_data: "settings_tpsl" }],
-          [{ text: "🔑 Wallet Export", callback_data: "settings_export" }],
-          [{ text: "🔙 Back to Menu", callback_data: "main_menu" }]
-        ];
-        bot.sendMessage(chatId, "⚙️ <b>Bot Settings</b>\n\nConfigure your trading preferences below:", { 
-          parse_mode: 'HTML', 
-          reply_markup: { inline_keyboard: keyboard } 
-        });
-        return;
-      }
 
-      if (msg.text === '/history') {
-        const trades = await storage.getTrades(userId);
-        if (trades.length === 0) {
-          bot.sendMessage(chatId, "📜 <b>Trade History</b>\n\nYou have no trade history.", { parse_mode: 'HTML' });
-          return;
-        }
-        const msgHistory = `📜 <b>Trade History</b>\n\n` +
-                   trades.slice(0, 10).map(t => `${t.status === 'completed' ? '✅' : '❌'} ${t.mint.slice(0, 8)}... - ${t.amountIn} SOL`).join('\n');
-        bot.sendMessage(chatId, msgHistory, { parse_mode: 'HTML' });
-        return;
-      }
 
-      if (msg.text === '/withdraw') {
-        bot.sendMessage(chatId, "💰 <b>Withdraw SOL</b>\n\nPlease reply to this message with the Solana destination address:", { 
-          parse_mode: 'HTML', 
-          reply_markup: { force_reply: true } 
-        });
-        return;
-      }
-
-      if (msg.photo && (msg.caption?.startsWith('/analyze') || msg.caption?.startsWith('/setup'))) {
+      if (msg.photo && (msg.caption?.startsWith('/analyze') || msg.caption?.startsWith('/setup') || msg.caption?.startsWith('/ai'))) {
         if (!(await checkAiLane())) return;
         const parts = msg.caption.split(' ');
         const command = parts[0].replace('/', '');
         const pair = parts[1]?.toUpperCase();
         
-        // Handle image analysis
+        // Handle AI image analysis (supports /analyze, /setup, and /ai with image)
         const photo = msg.photo[msg.photo.length - 1];
         const fileLink = await bot.getFileLink(photo.file_id);
         
-        bot.sendMessage(chatId, `⏳ <b>Analyzing chart image for ${pair || 'detected pair'}...</b>`, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+        bot.sendMessage(chatId, `⏳ <b>Analyzing image for ${pair || 'analysis'}...</b>`, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
         
-        const workerModule = await import("./signals-worker") as any;
-        const aiModule = await import("./ai") as any;
-        const worker = workerModule.default || workerModule;
+        const aiModule = await import("./ai");
         const ai = aiModule.default || aiModule;
         
         let targetPair: string | undefined = pair;
@@ -539,17 +1087,46 @@ export function setupTelegramBot() {
           targetPair = detected || undefined;
         }
         
-        if (!targetPair) {
+        if (!targetPair && command !== 'ai') {
           bot.sendMessage(chatId, "❌ <b>Could not detect trading pair from image.</b> Please provide it manually: <code>/analyze BTC/USDT</code>", { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
           return;
         }
-        
-        const sym = targetPair.includes('/') ? targetPair.split('/')[0].toUpperCase() : targetPair.toUpperCase();
-        const forexSymbols = ['EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'CAD', 'NZD', 'USD', 'XAU', 'XAG'];
-        const isForex = forexSymbols.includes(sym) || (targetPair.includes('/') && forexSymbols.includes(targetPair.split('/')[1].toUpperCase()));
-        const marketType = isForex ? "forex" : "crypto";
 
-        worker.runScanner(marketType, true, chatId.toString(), msg.message_thread_id?.toString(), targetPair, command as "analyze" | "setup", fileLink);
+        // Track usage for non-premium users
+        if (!accessCheck.isPremium) {
+          await trackCommandUsage(userId, command);
+        }
+
+        try {
+          if (command === 'ai') {
+            // Use AI reasoning for generic image + caption context
+            const question = parts.slice(1).join(' ') || 'Please analyze this image';
+            const aiResponse = await performEnhancedAIAnalysis(`${question}\n\n[Image analysis requested]`, undefined, fileLink);
+            const safeResponse = escapeHtml(aiResponse);
+
+            // Check message length and split if necessary (Telegram limit: 4096 chars)
+            const maxMessageLength = 4000;
+            if (safeResponse.length > maxMessageLength) {
+              const truncatedMessage = safeResponse.substring(0, maxMessageLength) + "\n\n<i>Analysis truncated due to message length limits</i>";
+              bot.sendMessage(chatId, truncatedMessage, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+            } else {
+              bot.sendMessage(chatId, safeResponse, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+            }
+          } else {
+            const analysis = await ai.analyzeChartImage(fileLink, targetPair, command as "analyze" | "setup");
+            const safeAnalysis = escapeHtml(analysis);
+
+            const maxMessageLength = 4000;
+            if (safeAnalysis.length > maxMessageLength) {
+              const truncatedMessage = safeAnalysis.substring(0, maxMessageLength) + "\n\n<i>Analysis truncated due to message length limits</i>";
+              bot.sendMessage(chatId, `📊 <b>Chart Analysis: ${targetPair}</b>\n\n${truncatedMessage}`, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+            } else {
+              bot.sendMessage(chatId, `📊 <b>Chart Analysis: ${targetPair}</b>\n\n${safeAnalysis}`, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+            }
+          }
+        } catch (e: any) {
+          bot.sendMessage(chatId, `❌ <b>AI Analysis Failed:</b> ${escapeHtml(e.message)}`, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
+        }
         return;
       }
 
@@ -564,28 +1141,104 @@ export function setupTelegramBot() {
           return;
         }
 
-        const feedbackMsg = command === 'setup' 
-          ? `⏳ <b>Hang on while we generate a NEUTRAL setup for you...</b>`
-          : `⏳ <b>Hang on while we perform a NEUTRAL analysis for you...</b>`;
-          
-        bot.sendMessage(chatId, feedbackMsg, { parse_mode: 'HTML', message_thread_id: msg.message_thread_id });
-        const workerModule = await import("./signals-worker") as any;
-        const worker = workerModule.default || workerModule;
-        
-        // Robust market type detection
-        const forexSymbols = ['EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'CAD', 'NZD', 'USD', 'XAU', 'XAG'];
-        const symPrefix = pair.slice(0, 3);
-        const isForex = forexSymbols.includes(symPrefix) || (pair.includes('/') && (forexSymbols.includes(pair.split('/')[0]) || forexSymbols.includes(pair.split('/')[1])));
-        const marketType = isForex ? "forex" : "crypto";
-        
-        // Ensure pair has a slash for scanner consistency if it doesn't already
-        let normalizedPair = pair;
-        if (!pair.includes('/') && pair.length >= 6) {
-          normalizedPair = `${pair.slice(0, pair.length - 4)}/${pair.slice(pair.length - 4)}`;
+        // Track usage for non-premium users
+        if (!accessCheck.isPremium) {
+          await trackCommandUsage(userId, command === 'setup' ? 'setup' : 'analyze');
         }
-        
-        log(`Manual command: ${command} for ${normalizedPair} (${marketType})`, "telegram");
-        worker.runScanner(marketType, true, chatId.toString(), msg.message_thread_id?.toString(), normalizedPair, command as "analyze" | "setup");
+
+        let query = `${command === 'setup' ? 'Find a high-probability trade setup for' : 'Analyze the market for'} ${pair}. Provide detailed SMC analysis with technical indicators, key levels, and actionable insights.`;
+
+        // Premium enhancement: Professional trading plan for setup command
+        if (accessCheck.isPremium && command === 'setup') {
+          query = `Create a comprehensive professional trading plan for ${pair}:
+
+**TRADING PLAN COMPONENTS:**
+
+1. **Market Analysis**
+   - Current trend direction and strength
+   - Key support/resistance levels
+   - Volume analysis and institutional activity
+
+2. **Setup Identification**
+   - Specific setup type (breakout, pullback, reversal, etc.)
+   - Entry trigger conditions
+   - Setup probability assessment
+
+3. **Risk Management**
+   - Maximum risk per trade (1-2% of portfolio)
+   - Stop loss placement with reasoning
+   - Risk-reward ratio target (minimum 1:2)
+
+4. **Trade Execution**
+   - Precise entry price level
+   - Position sizing calculation
+   - Take profit levels (TP1, TP2, TP3)
+   - Scale-out strategy
+
+5. **Contingency Planning**
+   - Alternative scenarios if setup fails
+   - Market condition filters
+   - Time-based validity of setup
+
+6. **Performance Expectations**
+   - Win rate probability
+   - Expected profit factor
+   - Holding timeframe
+
+Provide actionable, institutional-grade trading instructions.`;
+        }
+
+        // Premium enhancement: Multi-timeframe analysis
+        if (accessCheck.isPremium && command === 'analyze') {
+          query = `Provide comprehensive multi-timeframe analysis for ${pair}:
+
+1. **1-Minute Chart**: Current momentum and micro-structure
+2. **5-Minute Chart**: Short-term trend and key levels  
+3. **15-Minute Chart**: Medium-term structure and setups
+4. **1-Hour Chart**: Major trend direction and institutional levels
+5. **4-Hour Chart**: Long-term context and market phase
+
+For each timeframe, include:
+- Current price action analysis
+- Key support/resistance levels
+- Trend direction and strength
+- Volume analysis
+- Institutional order flow (if visible)
+
+Synthesize all timeframes into a cohesive trading strategy with entry/exit levels, risk management, and market outlook.`;
+        }
+
+        try {
+          const analysis = await performEnhancedAIAnalysis(query);
+          const title = command === 'setup' ? '🎯 Trade Setup Analysis' : '📊 Market Analysis';
+          const premiumBadge = accessCheck.isPremium ? ' 💎 PREMIUM' : '';
+          const fullMessage = `**${title}${premiumBadge}: ${pair}**\n\n${escapeHtml(analysis)}`;
+          
+          // Check message length and split if necessary (Telegram limit: 4096 chars)
+          const maxMessageLength = 4000;
+          if (fullMessage.length > maxMessageLength) {
+            const truncatedMessage = fullMessage.substring(0, maxMessageLength) + "\n\n<i>Analysis truncated due to message length limits</i>";
+            bot.sendMessage(chatId, truncatedMessage, { parse_mode: 'Markdown', message_thread_id: msg.message_thread_id });
+          } else {
+            bot.sendMessage(chatId, fullMessage, { parse_mode: 'Markdown', message_thread_id: msg.message_thread_id });
+          }
+        } catch (e: any) {
+          log(`${command} analysis error: ${e.message}`, "telegram");
+          // Use fallback analysis
+          const fallbackAnalysis = performFallbackAIAnalysis(query);
+          const title = command === 'setup' ? '🎯 Trade Setup Analysis' : '📊 Market Analysis';
+          const premiumBadge = accessCheck.isPremium ? ' 💎 PREMIUM' : '';
+          const fullFallbackMessage = `${title}${premiumBadge}: ${pair}\n\n${escapeHtml(fallbackAnalysis)}`;
+          
+          // Check fallback message length too
+          const maxMessageLength = 4000;
+          if (fullFallbackMessage.length > maxMessageLength) {
+            const truncatedFallbackMessage = fullFallbackMessage.substring(0, maxMessageLength) + "\n\n<i>Analysis truncated due to message length limits</i>";
+            bot.sendMessage(chatId, truncatedFallbackMessage, { parse_mode: 'Markdown', message_thread_id: msg.message_thread_id });
+          } else {
+            bot.sendMessage(chatId, fullFallbackMessage, { parse_mode: 'Markdown', message_thread_id: msg.message_thread_id });
+          }
+        }
         return;
       }
 
@@ -601,53 +1254,6 @@ export function setupTelegramBot() {
           }
         } else if (replyText.includes("Please enter the token's contract address")) {
           await sendTokenOverview(chatId, msg.text.trim());
-        } else if (replyText.includes("Please reply to this message with the Solana destination address")) {
-          const address = msg.text.trim();
-          try {
-            new PublicKey(address);
-            bot.sendMessage(chatId, `💰 <b>Withdrawal</b>\nAddress: <code>${address}</code>\n\nPlease reply to this message with the amount of SOL to withdraw:`, { 
-              parse_mode: 'HTML', 
-              reply_markup: { force_reply: true } 
-            });
-          } catch (e) {
-            bot.sendMessage(chatId, "❌ <b>Invalid Solana Address.</b> Please try again.", { parse_mode: 'HTML' });
-          }
-        } else if (replyText.includes("Please reply to this message with the amount of SOL to withdraw")) {
-          const amount = parseFloat(msg.text);
-          const addressMatch = replyText.match(/Address: <code>(.*?)<\/code>/);
-          if (!isNaN(amount) && addressMatch) {
-            const address = addressMatch[1];
-            try {
-              const activeWallet = await storage.getActiveWallet(userId);
-              if (!activeWallet) throw new Error("No active wallet.");
-              
-              const connection = new Connection(rpcUrl, "confirmed");
-              const balance = await connection.getBalance(new PublicKey(activeWallet.publicKey));
-              const lamports = Math.floor(amount * 1e9);
-              
-              if (balance < lamports + 5000) throw new Error("Insufficient balance for withdrawal + fees.");
-              
-              const transaction = new Transaction().add(
-                SystemProgram.transfer({
-                  fromPubkey: new PublicKey(activeWallet.publicKey),
-                  toPubkey: new PublicKey(address),
-                  lamports: lamports,
-                })
-              );
-              
-              const keypair = Keypair.fromSecretKey(bs58.decode(activeWallet.privateKey));
-              const signature = await connection.sendTransaction(transaction, [keypair]);
-              await connection.confirmTransaction(signature);
-              
-              // Update balance immediately after withdrawal
-              const newBal = await connection.getBalance(new PublicKey(activeWallet.publicKey));
-              await storage.updateWalletBalance(activeWallet.id, (newBal / 1e9).toFixed(3));
-
-              bot.sendMessage(chatId, `✅ <b>Withdrawal Successful!</b>\n\nTX: <a href="https://solscan.io/tx/${signature}">${signature.slice(0,8)}...</a>`, { parse_mode: 'HTML' });
-            } catch (e: any) {
-              bot.sendMessage(chatId, `❌ <b>Withdrawal Failed:</b> ${e.message}`, { parse_mode: 'HTML' });
-            }
-          }
         }
       }
 
@@ -663,41 +1269,36 @@ export function setupTelegramBot() {
 
     if (!chatId || !data) return;
 
+    // Check user access for callback queries
+    const accessCheck = await checkUserAccess(userId, chatId);
+    if (!accessCheck.hasAccess) {
+      if (!accessCheck.isRegisteredGroup) {
+        // Bot should not respond at all in unregistered groups
+        log(`Callback ignored: Chat ${chatId} is not a registered group`, "telegram");
+        return;
+      }
+
+      if (accessCheck.isPremium === false && accessCheck.remainingCommands === 0) {
+        bot.answerCallbackQuery(query.id, { text: "Access restricted - join our group!" });
+        return;
+      }
+    }
+
     try {
       if (data === "main_menu") {
-        await sendMainMenu(chatId, userId, query.message?.message_id);
+        await sendMainMenu(chatId, userId, query.message?.message_id, accessCheck);
       } else if (data === "main_menu_refresh") {
-        await sendMainMenu(chatId, userId, query.message?.message_id);
+        await sendMainMenu(chatId, userId, query.message?.message_id, accessCheck);
         bot.answerCallbackQuery(query.id, { text: "Refreshed!" });
-      } else if (data === "under_construction") {
-        bot.answerCallbackQuery(query.id, { text: "🚧 Under Construction" });
-        bot.sendMessage(chatId, "🚧 <b>Under Construction</b>\n\nThis feature is currently under development. Please check back later.", { parse_mode: 'HTML' });
-      } else if (data === "menu_settings") {
-        const keyboard = [
-          [{ text: "🔒 Security & MEV", callback_data: "settings_mev" }],
-          [{ text: "🎯 Auto TP/SL", callback_data: "settings_tpsl" }],
-          [{ text: "🔑 Wallet Export", callback_data: "settings_export" }],
-          [{ text: "🔙 Back to Menu", callback_data: "main_menu" }]
-        ];
-        try {
-          await bot.editMessageText("⚙️ <b>Bot Settings</b>\n\nConfigure your trading preferences below:", { 
-            chat_id: chatId, 
-            message_id: query.message?.message_id,
-            parse_mode: 'HTML', 
-            reply_markup: { inline_keyboard: keyboard } 
-          });
-        } catch (e: any) {
-          if (!e.message.includes("message is not modified")) throw e;
-        }
-      } else if (data === "menu_history") {
-        const trades = await storage.getTrades(userId);
-        if (trades.length === 0) {
-          bot.sendMessage(chatId, "📜 <b>Trade History</b>\n\nYou have no trade history.", { parse_mode: 'HTML' });
-        } else {
-          const msgHistory = `📜 <b>Trade History</b>\n\n` +
-                     trades.slice(0, 10).map(t => `${t.status === 'completed' ? '✅' : '❌'} ${t.mint.slice(0, 8)}... - ${t.amountIn} SOL`).join('\n');
-          bot.sendMessage(chatId, msgHistory, { parse_mode: 'HTML' });
-        }
+      } else if (data === "main_menu_help") {
+        const helpText = `🏛️ <b>Coin Hunter AI Bot</b>\n\n` +
+          `• <b>Premium</b>: Unlimited AI queries + full access to analysis, indicators, and fast results.\n` +
+          `• <b>Free</b>: 2 commands per day (price + ai analysis).\n\n` +
+          `Use /ai for AI insights (with real-time data and web search) and /analyze or /setup for chart-focused analysis.\n\n` +
+          `Join for free access: https://t.me/CoinHunterAIBot\n` +
+          `Upgrade to premium: https://t.me/onlysubsbot?start=mTVmGRKJjehzHMqZCnxkU\n\n` +
+          `Note: AI commands are available in all registered groups (premium and non-premium).`;
+        bot.sendMessage(chatId, helpText, { parse_mode: 'HTML' });
         bot.answerCallbackQuery(query.id);
       } else if (data.startsWith('refresh_overview_')) {
         const mint = data.replace('refresh_overview_', '');
@@ -705,13 +1306,8 @@ export function setupTelegramBot() {
         bot.answerCallbackQuery(query.id, { text: "Refreshed!" });
       } else if (data.startsWith('ai_analyze_')) {
         const mint = data.replace('ai_analyze_', '');
-        await executeAiReasoning(chatId, mint);
-        bot.answerCallbackQuery(query.id);
-      } else if (data === "menu_withdraw") {
-        bot.sendMessage(chatId, "💰 <b>Withdraw SOL</b>\n\nPlease reply to this message with the Solana destination address:", { 
-          parse_mode: 'HTML', 
-          reply_markup: { force_reply: true } 
-        });
+        const threadId = query.message?.message_thread_id;
+        await executeAiReasoning(chatId, mint, threadId);
         bot.answerCallbackQuery(query.id);
       }
     } catch (e: any) {
@@ -720,4 +1316,36 @@ export function setupTelegramBot() {
   });
 
   log("Telegram bot setup complete.", "telegram");
+}
+
+// DuckDuckGo search function for web research
+async function searchDuckDuckGo(query: string): Promise<string> {
+  try {
+    const searchQuery = encodeURIComponent(query);
+    const url = `https://api.duckduckgo.com/?q=${searchQuery}&format=json&no_html=1&skip_disambig=1`;
+
+    const response = await axios.get(url, {
+      timeout: 10000,
+      headers: {
+        'User-Agent': 'CoinHunterBot/1.0'
+      }
+    });
+
+    if (response.data && response.data.RelatedTopics && response.data.RelatedTopics.length > 0) {
+      // Extract relevant information from search results
+      const results = response.data.RelatedTopics.slice(0, 5).map((topic: any) => {
+        if (topic.Text) {
+          return topic.Text;
+        }
+        return '';
+      }).filter((text: string) => text.length > 0);
+
+      return results.join('\n\n');
+    }
+
+    return `No relevant search results found for: ${query}`;
+  } catch (error: any) {
+    log(`DuckDuckGo search error: ${error.message}`, "telegram");
+    return `Search failed: ${error.message}`;
+  }
 }

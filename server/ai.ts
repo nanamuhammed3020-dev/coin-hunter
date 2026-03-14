@@ -35,7 +35,7 @@ export async function extractPairFromImage(imageUrl: string): Promise<string | n
   if (!c) return null;
 
   try {
-    const model = "google/gemini-2.0-flash-001";
+    const model = "anthropic/claude-3-haiku";
     const response: any = await c.chat.completions.create({
       model: model,
       max_tokens: 500,
@@ -83,7 +83,79 @@ export async function extractPairFromImage(imageUrl: string): Promise<string | n
     }
 
     return null;
-  } catch (e) {
+  } catch (e: any) {
+    console.error("Pair extraction error:", e);
     return null;
+  }
+}
+
+export async function analyzeChartImage(imageUrl: string, pair?: string, command: 'analyze' | 'setup' = 'analyze'): Promise<string> {
+  const c = initClient();
+  if (!c) return "AI service unavailable for chart analysis.";
+
+  try {
+    const now = new Date();
+    const currentTime = now.toISOString();
+    const utcTime = now.toUTCString();
+
+    const systemPrompt = `You are an expert SMC (Smart Money Concepts) trader and technical analyst. Analyze the provided chart image with professional precision.
+
+CURRENT TIME CONTEXT:
+- UTC Time: ${utcTime}
+- Analysis Time: ${currentTime}
+
+ANALYSIS REQUIREMENTS:
+1. **Price Action**: Identify current price, recent highs/lows, candle patterns
+2. **Technical Indicators**: RSI, MACD, moving averages, support/resistance levels
+3. **Volume Analysis**: Volume patterns, institutional activity
+4. **SMC Concepts**: 
+   - Liquidity zones (high/low liquidity)
+   - Institutional order flow
+   - Market manipulation patterns
+   - Smart money positioning
+5. **Timeframes**: Identify the chart timeframe and context
+6. **Risk Management**: Entry/exit points, stop losses, position sizing
+7. **Market Structure**: Higher highs/lows, lower highs/lows, range markets
+
+${command === 'setup' ? 
+  'FOCUS: Find high-probability trade setups with clear entry/exit criteria.' :
+  'FOCUS: Provide comprehensive market analysis with actionable insights.'}
+
+RESPONSE FORMAT:
+- **Current Market Structure**
+- **Key Levels** (Support/Resistance/Liquidity)
+- **Technical Indicators**
+- **SMC Analysis**
+- **Trade Setup** (if applicable)
+- **Risk Assessment**
+- **Time Context**
+
+Be precise, professional, and actionable. Include confidence levels for your analysis.`;
+
+    const userPrompt = pair 
+      ? `Analyze this ${pair} chart image. Provide detailed SMC analysis and ${command === 'setup' ? 'identify potential trade setups' : 'market insights'}.`
+      : `Analyze this trading chart image. Identify the trading pair, timeframe, and provide comprehensive SMC analysis.`;
+
+    const model = "anthropic/claude-3-haiku";
+    const response: any = await c.chat.completions.create({
+      model: model,
+      max_tokens: 2000,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: [
+          { type: "text", text: userPrompt },
+          { type: "image_url", image_url: { url: imageUrl } }
+        ]}
+      ],
+      extra_headers: {
+        "HTTP-Referer": "https://replit.com",
+        "X-Title": "SMC Trading Bot"
+      }
+    } as any);
+
+    return (response as any).choices?.[0]?.message?.content || "Chart analysis unavailable.";
+  } catch (e: any) {
+    console.error("Chart analysis error:", e);
+    return `Chart analysis failed: ${e.message}`;
   }
 }

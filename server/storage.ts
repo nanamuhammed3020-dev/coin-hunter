@@ -1,12 +1,13 @@
-import { users, wallets, signals, trades, userLanes, groupBindings, userSubscriptions } from "../shared/schema";
+import { users, wallets, signals, trades, userLanes, groupBindings, userSubscriptions, commandUsage } from "../shared/schema";
 import type { 
   User, InsertUser, 
   Wallet, InsertWallet, 
   Signal, InsertSignal, 
   Trade, InsertTrade, 
   UserLane, InsertUserLane,
-  GroupBinding, InsertGroupBinding
-  , InsertUserSubscription, UserSubscription
+  GroupBinding, InsertGroupBinding,
+  UserSubscription, InsertUserSubscription,
+  CommandUsage, InsertCommandUsage
 } from "../shared/schema";
 import { db } from "./db";
 import { eq, desc, and, or } from "drizzle-orm";
@@ -260,6 +261,29 @@ export class DatabaseStorage implements IStorage {
     const [trade] = await db.update(trades).set(data).where(eq(trades.id, id)).returning();
     if (!trade) throw new Error("Trade not found");
     return trade as Trade;
+  }
+
+  // Command usage tracking
+  async getCommandUsage(userId: string, date: string): Promise<CommandUsage[]> {
+    return db.select().from(commandUsage).where(
+      and(eq(commandUsage.userId, userId), eq(commandUsage.date, date))
+    ) as any;
+  }
+
+  async incrementCommandUsage(userId: string, command: string, date: string): Promise<void> {
+    const existing = await db.select().from(commandUsage).where(
+      and(eq(commandUsage.userId, userId), eq(commandUsage.command, command), eq(commandUsage.date, date))
+    );
+    if (existing.length > 0) {
+      await db.update(commandUsage).set({ count: existing[0].count + 1 }).where(eq(commandUsage.id, existing[0].id));
+    } else {
+      await db.insert(commandUsage).values({ userId, command, date, count: 1 });
+    }
+  }
+
+  async getTotalDailyUsage(userId: string, date: string): Promise<number> {
+    const usages = await this.getCommandUsage(userId, date);
+    return usages.reduce((sum, usage) => sum + usage.count, 0);
   }
 }
 

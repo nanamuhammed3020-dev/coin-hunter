@@ -7,6 +7,10 @@ import { restoreFromSupabase, backupToSupabase } from "./restore";
 import path from "path";
 import fs from "fs";
 import { createServer } from "http";
+import dotenv from "dotenv";
+
+// Load environment variables
+dotenv.config();
 
 const app = express();
 app.use(express.json());
