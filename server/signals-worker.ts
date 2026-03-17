@@ -206,9 +206,22 @@ async function runUnifiedScanner() {
   const now = new Date();
   const day = now.getUTCDay();
   const hour = now.getUTCHours();
+  const minute = now.getUTCMinutes();
   const isWeekend = (day === 6) || (day === 0 && hour < 22) || (day === 5 && hour >= 22);
   
+  // Check if it's signal time (00:00 UTC by default, or within 5 minutes of it)
+  const isSignalTime = (hour === 0 && minute <= 5) || isForce;
+  
+  log(`Signal Time Check: ${hour}:${minute.toString().padStart(2, '0')} UTC, isSignalTime=${isSignalTime}`, "scanner");
   log(`Forex Market Check: Day=${day}, Hour=${hour}, isWeekend=${isWeekend}`, "scanner");
+
+  // Only proceed with signal generation if it's signal time or forced
+  if (!isSignalTime) {
+    log(`[scanner] Not signal time yet. Next signal at 00:00 UTC. Current time: ${hour}:${minute.toString().padStart(2, '0')} UTC`, "scanner");
+    return;
+  }
+  
+  log(`[scanner] ✅ Signal time reached! Starting ${new Date().toISOString()} UTC`, "scanner");
 
   try {
     const cryptoBindings = await db.select().from(groupBindings).where(eq(groupBindings.market, "crypto"));
@@ -872,7 +885,7 @@ export async function runMonitoringLoop() {
           if (isFinalStatus) {
             log(`[monitor] Final status for ${signal.symbol}. Triggering 10m cooldown for ${signal.type} bindings.`, "monitor");
             const cooldownKey = `cooldown_${signal.type}`;
-            const cooldownTime = Date.now() + (10 * 60 * 1000);
+            const cooldownTime = Date.now() + (10 * 60 * 1000); // 10 minute cooldown
             
             for (const targetBinding of targetBindings) {
               try {
@@ -880,6 +893,7 @@ export async function runMonitoringLoop() {
                 await db.update(groupBindings).set({
                   data: JSON.stringify({ ...currentData, [cooldownKey]: cooldownTime })
                 } as any).where(eq(groupBindings.id, targetBinding.id));
+                log(`[monitor] Set ${cooldownKey} for group ${targetBinding.groupId} until ${new Date(cooldownTime).toLocaleTimeString()}`, "monitor");
               } catch (e: any) {
                 log(`[monitor] Failed to set cooldown for group ${targetBinding.groupId}: ${e.message}`, "monitor");
               }

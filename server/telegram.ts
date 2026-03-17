@@ -386,6 +386,13 @@ ${pairInfo}
       const sells = pair.txns?.h24?.sells || 0;
       const change = pair.priceChange?.h24 ? `${pair.priceChange.h24 > 0 ? '+' : ''}${pair.priceChange.h24}%` : "0%";
 
+      // Extract social links from DexScreener
+      const socials = pair.info || {};
+      const website = socials.websites?.[0]?.url || 'N/A';
+      const twitter = socials.socials?.find((s: any) => s.type === 'twitter')?.url || 'N/A';
+      const telegram = socials.socials?.find((s: any) => s.type === 'telegram')?.url || 'N/A';
+      const discord = socials.socials?.find((s: any) => s.type === 'discord')?.url || 'N/A';
+
       // Check if user is premium for enhanced overview
       const userId = "unknown"; // We don't have userId here, but we can check group premium status
       const premiumGroupIds = process.env.PREMIUM_GROUP_IDS?.split(',') || [];
@@ -394,6 +401,47 @@ ${pairInfo}
       const safeName = escapeHtml(name);
       const safeSymbol = escapeHtml(symbol);
       const safeMint = escapeHtml(mint);
+
+      // Always perform AI social analysis for meme coins
+      let socialAnalysis = '';
+      try {
+        const { openRouterClient } = await import("./signals-worker");
+        if (openRouterClient) {
+          const socialPrompt = `Analyze this meme coin's social presence and community strength:
+
+TOKEN: ${name} (${symbol})
+WEBSITE: ${website}
+TWITTER: ${twitter}
+TELEGRAM: ${telegram}
+DISCORD: ${discord}
+
+MARKET DATA:
+- Price: ${price}
+- Market Cap: ${mcap}
+- 24h Volume: ${vol}
+- 24h Transactions: ${buys + sells} (${buys} buys, ${sells} sells)
+
+Provide a brief analysis of:
+1. Social media presence quality and activity
+2. Community engagement indicators
+3. Red flags or positive signals
+4. Overall community health score (1-10)
+
+Keep analysis concise but insightful.`;
+
+          const aiResponse = await (openRouterClient as any).chat.completions.create({
+            model: "google/gemini-2.0-flash-001",
+            messages: [{ role: "user", content: socialPrompt }],
+            max_tokens: 500,
+            temperature: 0.7
+          });
+
+          socialAnalysis = aiResponse.choices[0].message?.content || "Social analysis unavailable.";
+        }
+      } catch (aiError) {
+        log(`AI social analysis failed: ${aiError.message}`, "telegram");
+        socialAnalysis = "AI analysis temporarily unavailable.";
+      }
 
       let message = `🧪 <b>Token Overview</b>\n\n` +
                     `📛 Name: ${safeName}\n` +
@@ -405,11 +453,14 @@ ${pairInfo}
                     `• Liquidity: ${liq}\n` +
                     `• Volume (24h): ${vol}\n\n` +
                     `📈 <b>Activity (24h)</b>\n` +
-                    `• Buys: ${buys}\n` +
-                    `• Sells: ${sells}\n` +
+                    `• Buys: ${buys} | Sells: ${sells}\n` +
                     `• Change: ${change}\n\n` +
-                    `🌐 <b>Chart</b>\n` +
-                    `https://dexscreener.com/solana/${safeMint}\n\n` +
+                    `🌐 <b>Social Links</b>\n` +
+                    `• Website: ${website !== 'N/A' ? website : 'N/A'}\n` +
+                    `• Twitter: ${twitter !== 'N/A' ? twitter : 'N/A'}\n` +
+                    `• Telegram: ${telegram !== 'N/A' ? telegram : 'N/A'}\n` +
+                    `• Discord: ${discord !== 'N/A' ? discord : 'N/A'}\n\n` +
+                    `🤖 <b>AI Social Analysis</b>\n${escapeHtml(socialAnalysis)}\n\n` +
                     `⚠️ <i>This is not financial advice.</i>`;
 
       // Premium enhancements
@@ -438,12 +489,16 @@ ${pairInfo}
                   `• ${holderAnalysis}\n` +
                   `• Liq/MCap Ratio: ${liqToMcap}%\n` +
                   `• Vol/MCap Ratio: ${volToMcap}%\n\n` +
+                  `🌐 <b>Social Links</b>\n` +
+                  `• Website: ${website !== 'N/A' ? website : 'N/A'}\n` +
+                  `• Twitter: ${twitter !== 'N/A' ? twitter : 'N/A'}\n` +
+                  `• Telegram: ${telegram !== 'N/A' ? telegram : 'N/A'}\n` +
+                  `• Discord: ${discord !== 'N/A' ? discord : 'N/A'}\n\n` +
+                  `🤖 <b>AI Social Analysis</b>\n${escapeHtml(socialAnalysis)}\n\n` +
                   `🔍 <b>Premium Insights</b>\n` +
                   `• <b>Risk Level:</b> ${pair.liquidity?.usd && pair.liquidity.usd < 10000 ? 'High' : pair.liquidity.usd < 50000 ? 'Medium' : 'Low'}\n` +
                   `• <b>Volume Health:</b> ${pair.volume?.h24 && pair.fdv ? (pair.volume.h24 > pair.fdv * 0.1 ? 'Excellent' : pair.volume.h24 > pair.fdv * 0.05 ? 'Good' : 'Poor') : 'Unknown'}\n` +
                   `• <b>Community Activity:</b> ${buys + sells > 100 ? 'High' : buys + sells > 50 ? 'Medium' : 'Low'}\n\n` +
-                  `🌐 <b>Chart & Links</b>\n` +
-                  `https://dexscreener.com/solana/${safeMint}\n\n` +
                   `⚠️ <i>Institutional analysis included. Not financial advice.</i>`;
       }
 
@@ -478,15 +533,24 @@ ${pairInfo}
       const tokenName = pair.baseToken.name;
       const tokenSymbol = pair.baseToken.symbol;
 
+      // Extract social links from DexScreener for enhanced analysis
+      const socials = pair.info || {};
+      const website = socials.websites?.[0]?.url || 'Not available';
+      const twitter = socials.socials?.find((s: any) => s.type === 'twitter')?.url || 'Not available';
+      const telegramSocial = socials.socials?.find((s: any) => s.type === 'telegram')?.url || 'Not available';
+      const discord = socials.socials?.find((s: any) => s.type === 'discord')?.url || 'Not available';
+
       // Perform extensive web research for meme coins
       let researchResults = '';
       try {
-        bot.sendMessage(chatId, "🔍 <b>Researching web for latest information...</b>", { parse_mode: 'HTML', message_thread_id: threadId });
+        bot.sendMessage(chatId, "🔍 <b>Researching web and analyzing socials...</b>", { parse_mode: 'HTML', message_thread_id: threadId });
         const searchQueries = [
           `${tokenName} ${tokenSymbol} news latest developments`,
           `${tokenSymbol} meme coin analysis market sentiment`,
           `${tokenName} token community growth partnerships`,
-          `${tokenSymbol} price prediction technical analysis`
+          `${tokenSymbol} price prediction technical analysis`,
+          `${tokenName} social media community analysis`,
+          `${tokenSymbol} Twitter Telegram Discord activity`
         ];
 
         const searchPromises = searchQueries.map(query => searchDuckDuckGo(query));
@@ -505,7 +569,13 @@ ${pairInfo}
         liquidity: pair.liquidity?.usd,
         volume24h: pair.volume?.h24,
         txns24h: pair.txns?.h24,
-        priceChange24h: pair.priceChange?.h24
+        priceChange24h: pair.priceChange?.h24,
+        socials: {
+          website,
+          twitter,
+          telegram: telegramSocial,
+          discord
+        }
       });
 
       const { openRouterClient } = await import("./signals-worker");
@@ -516,7 +586,7 @@ ${pairInfo}
         messages: [
           {
             role: "system",
-            content: `You are an expert Solana meme coin analyst with access to real-time market data and extensive web research. Analyze this token comprehensively using both market data and web research findings.
+            content: `You are an expert Solana meme coin analyst with access to real-time market data, social media links, and extensive web research. Analyze this token comprehensively using all available data.
 
 MARKET DATA:
 ${marketData}
@@ -524,18 +594,31 @@ ${marketData}
 WEB RESEARCH FINDINGS:
 ${researchResults}
 
-Provide detailed institutional-grade analysis covering:
-- Liquidity analysis and LP status
-- Market structure and current metrics
-- Community and development insights from research
-- Investment analysis with risk assessment
-- Clear recommendation with entry/exit points
+CRITICAL ANALYSIS REQUIREMENTS:
+1. **Social Media Analysis** - Always analyze community presence, activity levels, and authenticity
+   - Check Twitter/Telegram/Discord engagement and follower growth
+   - Identify red flags like fake accounts, low activity, or suspicious patterns
+   - Assess community health and developer transparency
 
-Format your response professionally with emojis and clear sections. Include disclaimer about not being financial advice.`
+2. **Liquidity & LP Analysis** - Examine pool health and distribution
+3. **Market Structure** - Current metrics and trading patterns
+4. **Community & Development** - Insights from socials and web research
+5. **Risk Assessment** - Technical and fundamental risks
+6. **Investment Analysis** - Clear recommendations with entry/exit points
+
+Format professionally with emojis and clear sections. Include disclaimer about not being financial advice.`
           },
           {
             role: "user",
-            content: `Analyze ${tokenName} (${tokenSymbol}) as a potential meme coin investment. Use the provided market data and web research to give comprehensive analysis. Focus on community strength, development activity, market sentiment, and risk factors.`
+            content: `Analyze ${tokenName} (${tokenSymbol}) as a potential meme coin investment. 
+
+CRITICAL: Pay special attention to the social media links and community analysis. Check:
+- Are the social accounts active and authentic?
+- Community engagement levels and growth
+- Developer transparency and communication
+- Any red flags in social presence
+
+Use ALL provided data (market metrics, social links, web research) to give comprehensive analysis focusing on community strength, development activity, market sentiment, and risk factors.`
           }
         ],
         max_tokens: 3000,
